@@ -1,0 +1,13 @@
+{
+	"folders": [
+		{
+			"name": "DC-Rectifier-Controller",
+			"path": "."
+		},
+		{
+			"name": "Rectifier-Firmware",
+			"path": "../../PlatformIO/Projects/Rectifier-Firmware"
+		}
+	],
+	"settings": {}
+}
