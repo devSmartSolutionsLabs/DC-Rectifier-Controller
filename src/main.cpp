@@ -8,10 +8,23 @@
 
 
 #define DEBOUNCE_TIME_US 1000
-
+// Agregar estas variables globales
+volatile uint32_t START_DELAY_MS = 3000;  // 3 segundos de delay de inicio
+volatile bool startRequested = false;
+volatile uint32_t startRequestTime = 0;
+esp_timer_handle_t startDelayTimer;
+///////////////
+volatile bool testMode = false;
 // Declarar la constante como extern para que esté disponible en TTL.cpp
 extern const int NUM_DEVICES = 3;      // ← AÑADIR ESTA LÍNEA
 extern const int SEMI_PERIOD_US = 8333;  // ← AÑADIR ESTA LÍNEA
+// Variables globales para control
+volatile bool systemStarted = false;
+volatile bool direction = false; // false = una dirección, true = otra
+
+// Agregar estas variables globales
+volatile bool interruptsEnabled = true;
+volatile bool pwmGenerationEnabled = true;
 
 QueueHandle_t zcQueues[NUM_DEVICES] = {NULL, NULL, NULL};
 esp_timer_handle_t fireTimers[NUM_DEVICES];
@@ -40,6 +53,16 @@ bool ioControlEnabled = false;
 unsigned long lastInputCheckTime = 0;
 const unsigned long INPUT_CHECK_INTERVAL = 100; // 100ms entre lecturas
 
+void IRAM_ATTR startDelayCallback(void* arg) {
+    if (startRequested) {
+        systemStarted = true;
+        ioController.setRelay(0, true);  // Relé 1 ON
+        startRequested = false;
+        Serial.println("Sistema INICIADO - Relé 1 activado");
+        Serial.println("Delay de inicio completado");
+    }
+}
+
 // FUNCIÓN FORZADA PARA APAGAR SCR
 void IRAM_ATTR forceTurnOffSCR(uint8_t dev) {
     digitalWrite(scrPins[dev], LOW);
@@ -52,6 +75,8 @@ void IRAM_ATTR forceTurnOffSCR(uint8_t dev) {
 
 // ✅ ISRs OPTIMIZADAS
 void IRAM_ATTR zcISR_FaseA(void* arg) {
+    if (!systemStarted) return;  // ← NO procesar si sistema deshabilitado
+    
     uint32_t now = micros();
     if (now - lastZCTime[0] > DEBOUNCE_TIME_US) {
         lastZCTime[0] = now;
@@ -66,6 +91,8 @@ void IRAM_ATTR zcISR_FaseA(void* arg) {
 }
 
 void IRAM_ATTR zcISR_FaseB(void* arg) {
+    if (!systemStarted) return;  // ← NO procesar si sistema deshabilitado
+
     uint32_t now = micros();
     if (now - lastZCTime[1] > DEBOUNCE_TIME_US) {
         lastZCTime[1] = now;
@@ -80,6 +107,8 @@ void IRAM_ATTR zcISR_FaseB(void* arg) {
 }
 
 void IRAM_ATTR zcISR_FaseC(void* arg) {
+    if (!systemStarted) return;  // ← NO procesar si sistema deshabilitado
+    
     uint32_t now = micros();
     if (now - lastZCTime[2] > DEBOUNCE_TIME_US) {
         lastZCTime[2] = now;
@@ -95,6 +124,8 @@ void IRAM_ATTR zcISR_FaseC(void* arg) {
 
 // Callback de timer - ENCENDER SCR
 void IRAM_ATTR timerCallback(void* arg) {
+    if (!systemStarted) return;  // ← No disparar si sistema deshabilitado
+    
     uint8_t dev = (uint8_t)(intptr_t)arg;
     digitalWrite(scrPins[dev], HIGH);
     scrActive[dev] = true;
@@ -119,11 +150,18 @@ void controlTaskFaseA(void* param) {
     
     while (true) {
         if (xQueueReceive(zcQueues[0], &dev, portMAX_DELAY) == pdTRUE) {
+            if (!systemStarted) {
+                forceTurnOffSCR(0);
+                continue;
+            }
+            
             delay_us = map(potPercentage, 0, 100, SEMI_PERIOD_US, 100);
             if (delay_us < SEMI_PERIOD_US) {
                 esp_timer_start_once(fireTimers[0], delay_us);
             }
-            if (zcCount[0] > lastZC) {
+            
+            // ✅ SOLO IMPRIMIR EN MODO TEST
+            if (testMode && zcCount[0] > lastZC) {
                 lastZC = zcCount[0];
                 float firingAngle = (delay_us * 180.0) / SEMI_PERIOD_US;
                 Serial.printf("[FASE A] ZC#%lu | Pot: %d%% | Angle: %.1f°\n", 
@@ -141,12 +179,20 @@ void controlTaskFaseB(void* param) {
     
     while (true) {
         if (xQueueReceive(zcQueues[1], &dev, portMAX_DELAY) == pdTRUE) {
+            if (!systemStarted) {
+                forceTurnOffSCR(1);
+                continue;
+            }
+            
             delay_us = map(potPercentage, 0, 100, SEMI_PERIOD_US, 100);
             if (delay_us < SEMI_PERIOD_US) {
                 esp_timer_start_once(fireTimers[1], delay_us);
             }
-            if (zcCount[1] > lastZC) {
+            
+            // ✅ SOLO IMPRIMIR EN MODO TEST
+            if (testMode && zcCount[1] > lastZC) {
                 lastZC = zcCount[1];
+                Serial.printf("[FASE B] ZC#%lu | Pot: %d%%\n", zcCount[1], potPercentage);
             }
         }
         vTaskDelay(1 / portTICK_PERIOD_MS);
@@ -160,39 +206,123 @@ void controlTaskFaseC(void* param) {
     
     while (true) {
         if (xQueueReceive(zcQueues[2], &dev, portMAX_DELAY) == pdTRUE) {
+            if (!systemStarted) {
+                forceTurnOffSCR(2);
+                continue;
+            }
+            
             delay_us = map(potPercentage, 0, 100, SEMI_PERIOD_US, 100);
             if (delay_us < SEMI_PERIOD_US) {
                 esp_timer_start_once(fireTimers[2], delay_us);
             }
-            if (zcCount[2] > lastZC) {
+            
+            // ✅ SOLO IMPRIMIR EN MODO TEST
+            if (testMode && zcCount[2] > lastZC) {
                 lastZC = zcCount[2];
+                Serial.printf("[FASE C] ZC#%lu | Pot: %d%%\n", zcCount[2], potPercentage);
             }
         }
         vTaskDelay(1 / portTICK_PERIOD_MS);
     }
 }
 
-// Función para verificar entradas digitales ← AÑADIR ESTA FUNCIÓN
+void processInputChanges(uint8_t inputStates) {
+    // Leer botones (invertidos por pull-up)
+    bool startButton = !(inputStates & 0x01);    // B0 - START
+    bool stopButton = !(inputStates & 0x02);     // B1 - STOP  
+    bool directionSelector = !(inputStates & 0x04); // B2 - DIR
+
+    // ✅ PROCESAR BOTÓN START (B0) CON DELAY
+    static bool lastStartState = false;
+    if (startButton && !lastStartState) {  // Flanco de subida (presionado)
+        if (!systemStarted && !startRequested) {
+            // SOLICITAR INICIO CON DELAY
+            startRequested = true;
+            startRequestTime = millis();
+            esp_timer_start_once(startDelayTimer, START_DELAY_MS * 1000);
+            
+            Serial.printf("Solicitud de inicio recibida. Iniciando en %d segundos...\n", 
+                         START_DELAY_MS / 1000);
+            Serial.println("Mantenga presionado STOP para cancelar");
+        }
+    }
+    lastStartState = startButton;
+
+    // ✅ PROCESAR BOTÓN STOP (B1) - CANCELAR INICIO O DETENER
+    static bool lastStopState = false;
+    if (stopButton && !lastStopState) {  // Flanco de subida (presionado)
+        // CANCELAR INICIO PENDIENTE
+        if (startRequested) {
+            startRequested = false;
+            esp_timer_stop(startDelayTimer);
+            Serial.println("Inicio cancelado por usuario");
+        }
+        
+        // DETENER SISTEMA SI ESTÁ ACTIVO
+        if (systemStarted) {
+            systemStarted = false;
+            ioController.setRelay(0, false);  // Relé 1 OFF
+            
+            // Apagar todos los SCRs inmediatamente
+            for (int i = 0; i < NUM_DEVICES; i++) {
+                forceTurnOffSCR(i);
+            }
+            
+            Serial.println("Sistema DETENIDO - Relé 1 desactivado");
+        }
+    }
+    lastStopState = stopButton;
+
+    // ✅ PROCESAR SELECTOR DIRECCIÓN (B2) - SIEMPRE
+    static bool lastDirection = false;
+    if (directionSelector != lastDirection) {
+        direction = directionSelector;
+        ioController.setRelay(1, direction);
+        
+        if (systemStarted) {
+            Serial.printf("[SISTEMA ACTIVO] Dirección: %s\n", direction ? "DIR-A" : "DIR-B");
+        } else if (startRequested) {
+            Serial.printf("[INICIO PENDIENTE] Dirección: %s\n", direction ? "DIR-A" : "DIR-B");
+        } else {
+            Serial.printf("[SISTEMA INACTIVO] Dirección: %s\n", direction ? "DIR-A" : "DIR-B");
+        }
+        
+        lastDirection = directionSelector;
+    }
+}
+
 void checkDigitalInputs() {
     if (!ioControlEnabled) return;
     
-    unsigned long currentTime = millis();
-    if (currentTime - lastInputCheckTime >= INPUT_CHECK_INTERVAL) {
-        lastInputCheckTime = currentTime;
+    static unsigned long lastDebounceTime = 0;
+    static uint8_t lastStableState = 0;
+    
+    if (millis() - lastInputCheckTime >= INPUT_CHECK_INTERVAL) {
+        lastInputCheckTime = millis();
         
-        // Leer y procesar entradas si está en modo monitor
-        if (ioController.isMonitoring()) {
-            uint8_t currentInputs = ioController.readGPIOB();  // ← CAMBIAR readAllInputs() por readGPIOA()
-            
-            // Detectar cambios
-            static uint8_t lastInputState = 0;
-            if (currentInputs != lastInputState) {
-                Serial.println(ioController.getInputsStatus());
-                lastInputState = currentInputs;
+        uint8_t currentInputs = ioController.readGPIOB();
+        
+        // Detectar cambios con debounce
+        if (currentInputs != lastStableState) {
+            if (millis() - lastDebounceTime > ioController.getDebounceTime()) {
+                lastDebounceTime = millis();
+                lastStableState = currentInputs;
+                
+                // Procesar cambios de estado
+                processInputChanges(currentInputs);
+                
+                // Logging si está en modo monitor
+                if (ioController.isMonitoring()) {
+                    Serial.println(ioController.getInputsStatus());
+                }
             }
         }
     }
 }
+
+
+
+
 
 void setup() {
     Serial.begin(115200);
@@ -246,6 +376,15 @@ void setup() {
         esp_timer_create(&fireArgs, &fireTimers[i]);
     }
 
+    esp_timer_create_args_t startDelayArgs = {
+        .callback = &startDelayCallback,
+        .arg = NULL,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "startDelayTimer",
+        .skip_unhandled_events = false
+    };
+    esp_timer_create(&startDelayArgs, &startDelayTimer);
+
     // ✅ Configurar ISRs con máxima prioridad
     gpio_install_isr_service(ESP_INTR_FLAG_LEVEL3);
     gpio_set_intr_type((gpio_num_t)zcPins[0], GPIO_INTR_POSEDGE);
@@ -286,15 +425,45 @@ void loop() {
         }
     }
     
-    // Verificar entradas digitales ← AÑADIR ESTA LÍNEA
+    // Verificar entradas digitales y procesar botones
     checkDigitalInputs();
+    
+    // Solo procesar zero crossing si el sistema está iniciado
+    if (!systemStarted) {
+        for (int i = 0; i < NUM_DEVICES; i++) {
+            forceTurnOffSCR(i); // Asegurar que todos los SCRs estén apagados
+        }
+    }
     
     // Estadísticas normales (solo fuera del modo calibración)
     static uint32_t lastStatsTime = 0;
+    // En el loop principal de main.cpp:
     if (millis() - lastStatsTime > 500 && !calibrationMode) {
         lastStatsTime = millis();
-        Serial.printf("Pot: %d%% | Voltage: %.2f mV |  RealVoltage: %.2f mV | RealCorriente: %.1f A ||  Current: %.2f mV\n", 
-                     potPercentage, potVoltage ,potVoltage/50.5-5.12, (potVoltage/50.5-5.12)*100, CurrentSensorVoltage);
+        
+        // ✅ SOLO IMPRIMIR EN MODO TEST
+        if (testMode) {
+            Serial.printf("Estado: %s | Pot: %d%% | Dirección: %s\n", 
+                        systemStarted ? "ACTIVO" : "INACTIVO",
+                        potPercentage,
+                        direction ? "DIR-A" : "DIR-B");
+            Serial.printf("Voltage: %.2f mV | Current: %.2f mV\n", 
+                        potVoltage, CurrentSensorVoltage);
+        }
+    }
+
+    // Mostrar cuenta regresiva si hay inicio pendiente
+    if (startRequested) {
+        static uint32_t lastCountdownTime = 0;
+        if (millis() - lastCountdownTime > 1000) {  // Actualizar cada segundo
+            lastCountdownTime = millis();
+            uint32_t elapsed = millis() - startRequestTime;
+            uint32_t remaining = START_DELAY_MS - elapsed;
+            
+            if (remaining > 0) {
+                Serial.printf("Iniciando en: %d segundos\n", remaining / 1000);
+            }
+        }
     }
     
     vTaskDelay(50 / portTICK_PERIOD_MS);

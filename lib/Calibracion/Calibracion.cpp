@@ -1,3 +1,4 @@
+#include <Arduino.h>
 #include "Calibracion.hpp"
 
 // --- Configuración EEPROM ---

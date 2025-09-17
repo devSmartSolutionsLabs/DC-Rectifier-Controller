@@ -1,3 +1,4 @@
+#include <Arduino.h>
 #include "TTL.hpp"
 #include "Calibracion.hpp"
 #include "Sensores.hpp"
@@ -164,6 +165,36 @@ void processIOCommands(String command) {
   else if (command == "PULLUPS_OFF") {
     ioController.enableInputPullups(false);
   }
+  // En la función processIOCommands de TTL.cpp, modifica el manejo de entradas:
+  else if (command.startsWith("INPUT_") && command.endsWith("_STATUS")) {
+      int inputNum = command.substring(6, 7).toInt() - 1;
+      if (inputNum >= 0 && inputNum < 8) {
+          bool state = ioController.readPinB(inputNum);  // Ya está correcto
+          Serial.printf("Entrada %d: %s\n", inputNum + 1, state ? "ACTIVA" : "INACTIVA");
+      } else {
+          Serial.println("Número de entrada inválido. Use 1-8");
+      }
+  }
+
+  else if (command == "TEST_MODE_ON") {
+    testMode = true;
+    Serial.println("Modo TEST activado - Prints habilitados");
+  }
+  else if (command == "TEST_MODE_OFF") {
+    testMode = false;
+      Serial.println("Modo TEST desactivado - Prints deshabilitados");
+  }
+  else if (command == "TEST_MODE_STATUS") {
+    Serial.printf("Modo TEST: %s\n", testMode ? "ACTIVADO" : "DESACTIVADO");
+  }
+
+  else if (command == "SYSTEM_STATUS") {
+    Serial.printf("Sistema: %s | ", systemStarted ? "ACTIVO" : "INACTIVO");
+    Serial.printf("Relé 1: %s | ", ioController.getRelayState(0) ? "ON" : "OFF");
+    Serial.printf("Relé 2: %s | ", ioController.getRelayState(1) ? "ON" : "OFF");
+    Serial.printf("Dirección: %s\n", direction ? "DIR-A" : "DIR-B");
+  }
+
   else {
     Serial.println("Comando IO no reconocido");
   }
@@ -304,6 +335,15 @@ void processSerialCommands() {
     else if (command == "SYSTEM_RESET") {
       Serial.println("Reiniciando sistema...");
       ESP.restart();
+    }
+
+    else if (command == "SET_START_DELAY") {
+    // Para configurar el delay por serial si quieres
+    int delaySec = command.substring(14).toInt();
+        if (delaySec > 0) {
+            START_DELAY_MS = delaySec * 1000;
+            Serial.printf("Delay de inicio configurado: %d segundos\n", delaySec);
+        }
     }
     // Procesar comandos de IO (MCP23017)
     else {

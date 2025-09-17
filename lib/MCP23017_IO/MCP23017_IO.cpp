@@ -1,3 +1,4 @@
+#include <Arduino.h>
 #include "MCP23017_IO.hpp"
 
 // MCP23017 register addresses

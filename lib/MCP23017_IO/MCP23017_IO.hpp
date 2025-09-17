@@ -50,6 +50,9 @@ public:
     bool readInput(uint8_t inputNum);
     void enableInputPullups(bool enable);
 
+    // En la clase MCP23017_IO, agregar:
+    uint16_t getDebounceTime() { return debounceTime; }
+
 private:
     uint8_t _addr;
     bool initialized;

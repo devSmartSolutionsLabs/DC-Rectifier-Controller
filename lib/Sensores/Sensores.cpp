@@ -1,3 +1,4 @@
+#include <Arduino.h>
 #include "Sensores.hpp"
 
 // Constantes para el potenciómetro
