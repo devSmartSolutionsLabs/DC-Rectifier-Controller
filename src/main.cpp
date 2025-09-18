@@ -5,26 +5,14 @@
 #include "Sensores.hpp"
 #include "TTL.hpp"
 #include "MCP23017_IO.hpp"  // ← AÑADIR ESTA LÍNEA
+#include "GlobalVars.hpp"
 
 
-#define DEBOUNCE_TIME_US 1000
-// Agregar estas variables globales
-volatile uint32_t START_DELAY_MS = 3000;  // 3 segundos de delay de inicio
-volatile bool startRequested = false;
-volatile uint32_t startRequestTime = 0;
-esp_timer_handle_t startDelayTimer;
-///////////////
-volatile bool testMode = false;
-// Declarar la constante como extern para que esté disponible en TTL.cpp
-extern const int NUM_DEVICES = 3;      // ← AÑADIR ESTA LÍNEA
-extern const int SEMI_PERIOD_US = 8333;  // ← AÑADIR ESTA LÍNEA
-// Variables globales para control
-volatile bool systemStarted = false;
-volatile bool direction = false; // false = una dirección, true = otra
 
 // Agregar estas variables globales
 volatile bool interruptsEnabled = true;
 volatile bool pwmGenerationEnabled = true;
+
 
 QueueHandle_t zcQueues[NUM_DEVICES] = {NULL, NULL, NULL};
 esp_timer_handle_t fireTimers[NUM_DEVICES];
@@ -43,15 +31,12 @@ volatile uint32_t pulseDuration[NUM_DEVICES] = {0};
 volatile uint32_t pulseCount[NUM_DEVICES] = {0};
 volatile uint32_t zcCount[NUM_DEVICES] = {0};
 
-// Variable compartida para el porcentaje del potenciómetro (0-100%)
-volatile int potPercentage = 50;
-volatile float potVoltage = 0;
-volatile float CurrentSensorVoltage = 0;
 
 // Variables para MCP23017 ← AÑADIR ESTAS VARIABLES
-bool ioControlEnabled = false;
+
 unsigned long lastInputCheckTime = 0;
 const unsigned long INPUT_CHECK_INTERVAL = 100; // 100ms entre lecturas
+
 
 void IRAM_ATTR startDelayCallback(void* arg) {
     if (startRequested) {
@@ -138,6 +123,7 @@ void VoltageReadTask(void* param) {
     while (true) {
         readPotenciometerSafe();
         readCurrentSafe();
+        readAllChannelsSafe(); // Leer todos los canales
         vTaskDelay(POT_READ_INTERVAL_MS / portTICK_PERIOD_MS);
     }
 }
@@ -443,13 +429,26 @@ void loop() {
         
         // ✅ SOLO IMPRIMIR EN MODO TEST
         if (testMode) {
-            Serial.printf("Estado: %s | Pot: %d%% | Dirección: %s\n", 
-                        systemStarted ? "ACTIVO" : "INACTIVO",
-                        potPercentage,
-                        direction ? "DIR-A" : "DIR-B");
-            Serial.printf("Voltage: %.2f mV | Current: %.2f mV\n", 
-                        potVoltage, CurrentSensorVoltage);
-        }
+        Serial.println("=== VALORES DE CANALES ===");
+        
+        // Información del sistema
+        Serial.printf("Sistema: %s | Pot: %d%% | Dirección: %s\n", 
+                    systemStarted ? "ACTIVO" : "INACTIVO",
+                    potPercentage,
+                    direction ? "DIR-A" : "DIR-B");
+        
+        // Canales single-ended (ADS 0x48)
+        Serial.println("Single-ended (0x48):");
+        Serial.printf("  CH0(Pot): %.2f mV | CH1: %.2f mV | CH2: %.2f mV | CH3: %.2f mV\n", 
+                    adcChannels[0], adcChannels[1], adcChannels[2], adcChannels[3]);
+        
+        // Canales diferenciales (ADS 0x49)
+        Serial.println("Diferenciales (0x49):");
+        Serial.printf("  DIF0-1(Corriente): %.2f mV | DIF2-3: %.2f mV\n", 
+                    adcChannels[4], adcChannels[5]);
+        
+        Serial.println("------------------------");
+    }
     }
 
     // Mostrar cuenta regresiva si hay inicio pendiente
