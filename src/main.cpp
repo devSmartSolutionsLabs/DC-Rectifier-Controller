@@ -150,8 +150,10 @@ void controlTaskFaseA(void* param) {
             if (testMode && zcCount[0] > lastZC) {
                 lastZC = zcCount[0];
                 float firingAngle = (delay_us * 180.0) / SEMI_PERIOD_US;
-                Serial.printf("[FASE A] ZC#%lu | Pot: %d%% | Angle: %.1f°\n", 
-                             zcCount[0], potPercentage, firingAngle);
+                //Serial.printf("[FASE A] ZC#%lu | Pot: %d%% | Angle: %.1f°", 
+                  //           zcCount[0], potPercentage, firingAngle);
+                //Serial.print("                                           \r");  // <-- sobrescribe en la misma línea             
+                //Serial.println();
             }
         }
         vTaskDelay(1 / portTICK_PERIOD_MS);
@@ -424,11 +426,12 @@ void loop() {
     // Estadísticas normales (solo fuera del modo calibración)
     static uint32_t lastStatsTime = 0;
     // En el loop principal de main.cpp:
-    if (millis() - lastStatsTime > 500 && !calibrationMode) {
+    if (millis() - lastStatsTime > 1000 && !calibrationMode) {
         lastStatsTime = millis();
         
         // ✅ SOLO IMPRIMIR EN MODO TEST
         if (testMode) {
+        Serial.print("                          \r");  // <-- sobrescribe en la misma línea
         Serial.println("=== VALORES DE CANALES ===");
         
         // Información del sistema
