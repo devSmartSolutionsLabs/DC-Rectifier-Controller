@@ -20,8 +20,8 @@ esp_timer_handle_t fireTimers[NUM_DEVICES];
 Adafruit_ADS1115 adsLow;   // 0x48
 Adafruit_ADS1115 adsHigh;  // 0x49
 
-const int zcPins[NUM_DEVICES] = {38, 47, 11};
-const int scrPins[NUM_DEVICES] = {48, 21, 12};
+const int zcPins[NUM_DEVICES] = {38, 47, 14};
+const int scrPins[NUM_DEVICES] = {48, 21, 13}; // 11 miso
 
 // Variables para control y medición
 volatile uint32_t lastZCTime[NUM_DEVICES] = {0};
@@ -50,7 +50,8 @@ void IRAM_ATTR startDelayCallback(void* arg) {
 
 // FUNCIÓN FORZADA PARA APAGAR SCR
 void IRAM_ATTR forceTurnOffSCR(uint8_t dev) {
-    digitalWrite(scrPins[dev], LOW);
+    GPIO.out_w1tc = (1 << scrPins[dev]);  
+    //digitalWrite(scrPins[dev], LOW);
     scrActive[dev] = false;
     if (pulseStartTime[dev] > 0) {
         pulseDuration[dev] = micros() - pulseStartTime[dev];
@@ -66,7 +67,8 @@ void IRAM_ATTR zcISR_FaseA(void* arg) {
     if (now - lastZCTime[0] > DEBOUNCE_TIME_US) {
         lastZCTime[0] = now;
         zcCount[0]++;
-        digitalWrite(scrPins[0], LOW);
+        GPIO.out_w1tc = (1 << scrPins[0]);  
+        //digitalWrite(scrPins[0], LOW);
         scrActive[0] = false;
         static uint8_t dev = 0;
         BaseType_t xHigherPriorityTaskWoken = pdFALSE;
@@ -82,7 +84,8 @@ void IRAM_ATTR zcISR_FaseB(void* arg) {
     if (now - lastZCTime[1] > DEBOUNCE_TIME_US) {
         lastZCTime[1] = now;
         zcCount[1]++;
-        digitalWrite(scrPins[1], LOW);
+        GPIO.out_w1tc = (1 << scrPins[1]);  
+        //digitalWrite(scrPins[1], LOW);
         scrActive[1] = false;
         static uint8_t dev = 1;
         BaseType_t xHigherPriorityTaskWoken = pdFALSE;
@@ -98,7 +101,8 @@ void IRAM_ATTR zcISR_FaseC(void* arg) {
     if (now - lastZCTime[2] > DEBOUNCE_TIME_US) {
         lastZCTime[2] = now;
         zcCount[2]++;
-        digitalWrite(scrPins[2], LOW);
+        GPIO.out_w1tc = (1 << scrPins[2]);  
+        //digitalWrite(scrPins[2], LOW);
         scrActive[2] = false;
         static uint8_t dev = 2;
         BaseType_t xHigherPriorityTaskWoken = pdFALSE;
@@ -112,7 +116,8 @@ void IRAM_ATTR timerCallback(void* arg) {
     if (!systemStarted) return;  // ← No disparar si sistema deshabilitado
     
     uint8_t dev = (uint8_t)(intptr_t)arg;
-    digitalWrite(scrPins[dev], HIGH);
+    GPIO.out_w1ts = (1 << scrPins[dev]);  
+    //digitalWrite(scrPins[dev], HIGH);
     scrActive[dev] = true;
     pulseStartTime[dev] = micros();
     pulseCount[dev]++;
@@ -141,7 +146,7 @@ void controlTaskFaseA(void* param) {
                 continue;
             }
             
-            delay_us = map(potPercentage, 0, 100, SEMI_PERIOD_US, 100);
+            delay_us = map(potPercentage, 0, 100, SEMI_PERIOD_US, 1);
             if (delay_us < SEMI_PERIOD_US) {
                 esp_timer_start_once(fireTimers[0], delay_us);
             }
@@ -172,7 +177,7 @@ void controlTaskFaseB(void* param) {
                 continue;
             }
             
-            delay_us = map(potPercentage, 0, 100, SEMI_PERIOD_US, 100);
+            delay_us = map(potPercentage, 0, 100, SEMI_PERIOD_US, 1);
             if (delay_us < SEMI_PERIOD_US) {
                 esp_timer_start_once(fireTimers[1], delay_us);
             }
@@ -199,7 +204,7 @@ void controlTaskFaseC(void* param) {
                 continue;
             }
             
-            delay_us = map(potPercentage, 0, 100, SEMI_PERIOD_US, 100);
+            delay_us = map(potPercentage, 0, 100, SEMI_PERIOD_US, 1);
             if (delay_us < SEMI_PERIOD_US) {
                 esp_timer_start_once(fireTimers[2], delay_us);
             }
@@ -344,7 +349,8 @@ void setup() {
     for (int i = 0; i < NUM_DEVICES; i++) {
         pinMode(zcPins[i], INPUT_PULLDOWN);
         pinMode(scrPins[i], OUTPUT);
-        digitalWrite(scrPins[i], LOW);
+        GPIO.out_w1tc = (1 << scrPins[i]);  
+        //digitalWrite(scrPins[i], LOW);
     }
 
     // ✅ Colas más grandes para no perder ZCs
