@@ -5,7 +5,7 @@
 
 // ✅ Cambiar constantes a #define para tiempo de compilación
 constexpr int NUM_DEVICES = 3;
-constexpr int SEMI_PERIOD_US = 8333;
+constexpr int SEMI_PERIOD_US = 8250;
 constexpr int DEBOUNCE_TIME_US = 1000;
 
 // Declaraciones extern de todas las variables globales

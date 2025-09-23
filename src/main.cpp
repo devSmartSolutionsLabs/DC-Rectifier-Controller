@@ -42,6 +42,7 @@ void IRAM_ATTR startDelayCallback(void* arg) {
     if (startRequested) {
         systemStarted = true;
         ioController.setRelay(0, true);  // Relé 1 ON
+        ioController.setRelay(4, true);  // Relé 5 ON: SE ENCIENDE VENTILADOR DE SCRS
         startRequested = false;
         Serial.println("Sistema INICIADO - Relé 1 activado");
         Serial.println("Delay de inicio completado");
@@ -67,8 +68,8 @@ void IRAM_ATTR zcISR_FaseA(void* arg) {
     if (now - lastZCTime[0] > DEBOUNCE_TIME_US) {
         lastZCTime[0] = now;
         zcCount[0]++;
-        GPIO.out_w1tc = (1 << scrPins[0]);  
-        //digitalWrite(scrPins[0], LOW);
+        //GPIO.out_w1tc = (1 << scrPins[0]);  
+        digitalWrite(scrPins[0], LOW);
         scrActive[0] = false;
         static uint8_t dev = 0;
         BaseType_t xHigherPriorityTaskWoken = pdFALSE;
@@ -84,8 +85,8 @@ void IRAM_ATTR zcISR_FaseB(void* arg) {
     if (now - lastZCTime[1] > DEBOUNCE_TIME_US) {
         lastZCTime[1] = now;
         zcCount[1]++;
-        GPIO.out_w1tc = (1 << scrPins[1]);  
-        //digitalWrite(scrPins[1], LOW);
+        //GPIO.out_w1tc = (1 << scrPins[1]);  
+        digitalWrite(scrPins[1], LOW);
         scrActive[1] = false;
         static uint8_t dev = 1;
         BaseType_t xHigherPriorityTaskWoken = pdFALSE;
@@ -101,8 +102,8 @@ void IRAM_ATTR zcISR_FaseC(void* arg) {
     if (now - lastZCTime[2] > DEBOUNCE_TIME_US) {
         lastZCTime[2] = now;
         zcCount[2]++;
-        GPIO.out_w1tc = (1 << scrPins[2]);  
-        //digitalWrite(scrPins[2], LOW);
+        //GPIO.out_w1tc = (1 << scrPins[2]);  
+        digitalWrite(scrPins[2], LOW);
         scrActive[2] = false;
         static uint8_t dev = 2;
         BaseType_t xHigherPriorityTaskWoken = pdFALSE;
@@ -116,8 +117,8 @@ void IRAM_ATTR timerCallback(void* arg) {
     if (!systemStarted) return;  // ← No disparar si sistema deshabilitado
     
     uint8_t dev = (uint8_t)(intptr_t)arg;
-    GPIO.out_w1ts = (1 << scrPins[dev]);  
-    //digitalWrite(scrPins[dev], HIGH);
+    //GPIO.out_w1ts = (1 << scrPins[dev]);  
+    digitalWrite(scrPins[dev], HIGH);
     scrActive[dev] = true;
     pulseStartTime[dev] = micros();
     pulseCount[dev]++;
@@ -146,19 +147,9 @@ void controlTaskFaseA(void* param) {
                 continue;
             }
             
-            delay_us = map(potPercentage, 0, 100, SEMI_PERIOD_US, 1);
+            delay_us = map(potPercentage, 0, 100, SEMI_PERIOD_US, 0);
             if (delay_us < SEMI_PERIOD_US) {
                 esp_timer_start_once(fireTimers[0], delay_us);
-            }
-            
-            // ✅ SOLO IMPRIMIR EN MODO TEST
-            if (testMode && zcCount[0] > lastZC) {
-                lastZC = zcCount[0];
-                float firingAngle = (delay_us * 180.0) / SEMI_PERIOD_US;
-                //Serial.printf("[FASE A] ZC#%lu | Pot: %d%% | Angle: %.1f°", 
-                  //           zcCount[0], potPercentage, firingAngle);
-                //Serial.print("                                           \r");  // <-- sobrescribe en la misma línea             
-                //Serial.println();
             }
         }
         vTaskDelay(1 / portTICK_PERIOD_MS);
@@ -177,15 +168,9 @@ void controlTaskFaseB(void* param) {
                 continue;
             }
             
-            delay_us = map(potPercentage, 0, 100, SEMI_PERIOD_US, 1);
+            delay_us = map(potPercentage, 0, 100, SEMI_PERIOD_US, 0);
             if (delay_us < SEMI_PERIOD_US) {
                 esp_timer_start_once(fireTimers[1], delay_us);
-            }
-            
-            // ✅ SOLO IMPRIMIR EN MODO TEST
-            if (testMode && zcCount[1] > lastZC) {
-                lastZC = zcCount[1];
-                Serial.printf("[FASE B] ZC#%lu | Pot: %d%%\n", zcCount[1], potPercentage);
             }
         }
         vTaskDelay(1 / portTICK_PERIOD_MS);
@@ -204,15 +189,9 @@ void controlTaskFaseC(void* param) {
                 continue;
             }
             
-            delay_us = map(potPercentage, 0, 100, SEMI_PERIOD_US, 1);
+            delay_us = map(potPercentage, 0, 100, SEMI_PERIOD_US, 0);
             if (delay_us < SEMI_PERIOD_US) {
                 esp_timer_start_once(fireTimers[2], delay_us);
-            }
-            
-            // ✅ SOLO IMPRIMIR EN MODO TEST
-            if (testMode && zcCount[2] > lastZC) {
-                lastZC = zcCount[2];
-                Serial.printf("[FASE C] ZC#%lu | Pot: %d%%\n", zcCount[2], potPercentage);
             }
         }
         vTaskDelay(1 / portTICK_PERIOD_MS);
@@ -255,6 +234,7 @@ void processInputChanges(uint8_t inputStates) {
         if (systemStarted) {
             systemStarted = false;
             ioController.setRelay(0, false);  // Relé 1 OFF
+            ioController.setRelay(4, false);  // Relé 1 OFF
             
             // Apagar todos los SCRs inmediatamente
             for (int i = 0; i < NUM_DEVICES; i++) {
@@ -271,7 +251,7 @@ void processInputChanges(uint8_t inputStates) {
     if (directionSelector != lastDirection) {
         direction = directionSelector;
         ioController.setRelay(1, direction);
-        
+            
         if (systemStarted) {
             Serial.printf("[SISTEMA ACTIVO] Dirección: %s\n", direction ? "DIR-A" : "DIR-B");
         } else if (startRequested) {
@@ -349,8 +329,8 @@ void setup() {
     for (int i = 0; i < NUM_DEVICES; i++) {
         pinMode(zcPins[i], INPUT_PULLDOWN);
         pinMode(scrPins[i], OUTPUT);
-        GPIO.out_w1tc = (1 << scrPins[i]);  
-        //digitalWrite(scrPins[i], LOW);
+        //GPIO.out_w1tc = (1 << scrPins[i]);  
+        digitalWrite(scrPins[i], LOW);
     }
 
     // ✅ Colas más grandes para no perder ZCs
