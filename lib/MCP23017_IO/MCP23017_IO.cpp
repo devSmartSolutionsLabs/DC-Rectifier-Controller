@@ -1,97 +1,133 @@
-#include <Arduino.h>
 #include "MCP23017_IO.hpp"
+#include "GlobalVars.hpp" // Para i2cMutex
 
-// MCP23017 register addresses
-#define IODIRA   0x00
-#define IODIRB   0x01
-#define GPPUA    0x0C
-#define GPPUB    0x0D
-#define GPIOA    0x12
-#define GPIOB    0x13
-#define OLATA    0x14
-#define OLATB    0x15
-
+// Instancia global
 MCP23017_IO ioController(MCP23017_ADDRESS);
 
-MCP23017_IO::MCP23017_IO(uint8_t address) : 
-    _addr(address), 
-    initialized(false), 
+// Constructor
+MCP23017_IO::MCP23017_IO(uint8_t address) :
+    _addr(address),
+    initialized(false),
     relayStates(0),
     lastInputStates(0),
     debounceTime(50),
     monitoringEnabled(false),
-    lastReadTime(0) {}
+    lastReadTime(0)
+{}
 
+// --- Inicialización ---
 bool MCP23017_IO::begin(uint8_t sda, uint8_t scl) {
-    Wire.begin(sda, scl);
-    
+    Serial.printf("[MCP23017] Inicializando en SDA:%d, SCL:%d, Addr:0x%02X\n", sda, scl, _addr);
     pinMode(15,OUTPUT);
+    pinMode(41,OUTPUT);
     digitalWrite(15,HIGH);
-    // Verificar comunicación con el dispositivo
-    Wire.beginTransmission(_addr);
-    if (Wire.endTransmission() != 0) {
-        Serial.printf("Error: No se pudo encontrar MCP23017 en dirección 0x%02X\n", _addr);
-        initialized = false;
+    digitalWrite(41,HIGH);
+    delay(200);
+
+    Wire.begin(sda, scl);
+    Wire.setTimeout(250);
+    delay(200);
+
+    // Verificación de dispositivo
+    bool found = false;
+    for (int i = 0; i < 3; i++) {
+        Wire.beginTransmission(_addr);
+        uint8_t error = Wire.endTransmission();
+        if (error == 0) {
+            found = true;
+            Serial.printf("✅ [MCP23017] Encontrado en intento %d\n", i+1);
+            break;
+        }
+        delay(100);
+    }
+    if (!found) {
+        Serial.println("❌ [MCP23017] No responde");
         return false;
     }
-    
-    // Configurar Puerto A como SALIDAS (0-7) para relés
-    setPortADirection(0x00);  // Todos como salidas
-    setPullupsA(0x00);        // Sin pull-ups en salidas
-    
-    // Configurar Puerto B como ENTRADAS (8-15) con pull-ups
-    setPortBDirection(0xFF);  // Todos como entradas
-    setPullupsB(0xFF);        // Pull-ups habilitados para todos
-    
-    writeGPIOA(0x00);         // Inicialmente todos los relés en LOW
-    
-    // Leer estado inicial de entradas
-    lastInputStates = readGPIOB();
-    
+
+    // Configuración con mutex
+    if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+        setPortADirection(0x00);  // Relés = salida
+        setPullupsA(0x00);
+        writeGPIOA(0x00);
+
+        setPortBDirection(0xFF);  // Entradas = entrada
+        setPullupsB(0xFF);        // Pull-ups activados
+
+        lastInputStates = readGPIOB();
+
+        xSemaphoreGive(i2cMutex);
+    } else {
+        Serial.println("❌ Timeout mutex en configuración");
+        return false;
+    }
+
     initialized = true;
-    Serial.printf("MCP23017 inicializado correctamente en dirección 0x%02X\n", _addr);
-    Serial.println("Puerto A: Salidas para relés (0-7)");
-    Serial.println("Puerto B: Entradas digitales (8-15) con pull-up");
+    Serial.println("✅ [MCP23017] Inicializado correctamente");
     return true;
 }
 
-void MCP23017_IO::setPortADirection(uint8_t dir) { 
-    writeRegister(IODIRA, dir); 
+// --- Estado ---
+bool MCP23017_IO::isInitialized() {
+    return initialized;
 }
 
-void MCP23017_IO::setPortBDirection(uint8_t dir) { 
-    writeRegister(IODIRB, dir); 
+// --- Lectura/escritura I2C segura ---
+uint8_t MCP23017_IO::readRegister(uint8_t reg) {
+    uint8_t val = 0xFF;
+    Wire.beginTransmission(_addr);
+    Wire.write(reg);
+    if (Wire.endTransmission() != 0) return 0xFF;
+    Wire.requestFrom(_addr, (uint8_t)1);
+    if (Wire.available()) val = Wire.read();
+    return val;
 }
 
-void MCP23017_IO::setPullupsA(uint8_t mask) { 
-    writeRegister(GPPUA, mask); 
+uint8_t MCP23017_IO::readRegisterSafe(uint8_t reg) {
+    uint8_t result = 0xFF;
+    if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        Serial.println("❌ Timeout mutex en readRegisterSafe");
+        return result;
+    }
+    result = readRegister(reg);
+    xSemaphoreGive(i2cMutex);
+    return result;
 }
 
-void MCP23017_IO::setPullupsB(uint8_t mask) { 
-    writeRegister(GPPUB, mask); 
+void MCP23017_IO::writeRegister(uint8_t reg, uint8_t value) {
+    if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        Serial.println("❌ Timeout mutex en writeRegister");
+        return;
+    }
+    Wire.beginTransmission(_addr);
+    Wire.write(reg);
+    Wire.write(value);
+    Wire.endTransmission();
+    xSemaphoreGive(i2cMutex);
 }
 
-// --- Control de Relés (Puerto A - Salidas) ---
+// --- Configuración de puertos ---
+void MCP23017_IO::setPortADirection(uint8_t dir) { writeRegister(IODIRA, dir); }
+void MCP23017_IO::setPortBDirection(uint8_t dir) { writeRegister(IODIRB, dir); }
+void MCP23017_IO::setPullupsA(uint8_t mask) { writeRegister(GPPUA, mask); }
+void MCP23017_IO::setPullupsB(uint8_t mask) { writeRegister(GPPUB, mask); }
+
+// --- Relés (Puerto A) ---
 void MCP23017_IO::writeGPIOA(uint8_t value) {
     writeRegister(GPIOA, value);
     relayStates = value;
 }
 
 void MCP23017_IO::writePinA(uint8_t pin, bool state) {
-    if (pin > 7) return;
-    
-    uint8_t currentState = readRegister(GPIOA);
-    if (state) {
-        currentState |= (1 << pin);
-    } else {
-        currentState &= ~(1 << pin);
-    }
-    writeGPIOA(currentState);
+    if (!initialized || pin > 7) return;
+    uint8_t curr = readRegisterSafe(GPIOA);
+    if (state) curr |= (1 << pin);
+    else curr &= ~(1 << pin);
+    writeGPIOA(curr);
 }
 
 void MCP23017_IO::setRelay(uint8_t relayNum, bool state) {
     if (!initialized || relayNum >= MAX_RELAYS) return;
-    
     writePinA(relayNum, state);
     Serial.printf("Relé %d %s\n", relayNum + 1, state ? "ENCENDIDO" : "APAGADO");
 }
@@ -102,99 +138,41 @@ bool MCP23017_IO::getRelayState(uint8_t relayNum) {
 }
 
 void MCP23017_IO::toggleRelay(uint8_t relayNum) {
-    if (!initialized || relayNum >= MAX_RELAYS) return;
     setRelay(relayNum, !getRelayState(relayNum));
 }
 
 void MCP23017_IO::setAllRelays(bool state) {
     if (!initialized) return;
-    
     writeGPIOA(state ? 0xFF : 0x00);
     Serial.printf("Todos los relés %s\n", state ? "ENCENDIDOS" : "APAGADOS");
 }
 
-void MCP23017_IO::testSequence(uint16_t delayMs) {
-    if (!initialized) return;
-    
-    Serial.println("Iniciando secuencia de prueba de relés...");
-    
-    // Apagar todos primero
-    setAllRelays(false);
-    delay(1000);
-    
-    // Encender uno por uno
-    for (int i = 0; i < MAX_RELAYS; i++) {
-        setRelay(i, true);
-        delay(delayMs);
-    }
-    
-    // Apagar uno por uno
-    for (int i = 0; i < MAX_RELAYS; i++) {
-        setRelay(i, false);
-        delay(delayMs);
-    }
-    
-    Serial.println("Secuencia de prueba completada");
-}
-
 String MCP23017_IO::getRelaysStatus() {
-    String status = "Estado Relés: ";
-    for (int i = 0; i < MAX_RELAYS; i++) {
-        status += String(i + 1) + ":" + (getRelayState(i) ? "ON " : "OFF ");
-    }
-    return status;
+    String s = "Estado Relés: ";
+    for (int i = 0; i < MAX_RELAYS; i++) s += String(i+1) + ":" + (getRelayState(i) ? "ON " : "OFF ");
+    return s;
 }
 
-// --- Lectura de Entradas (Puerto B - Entradas) ---
+// --- Entradas (Puerto B) ---
+uint8_t MCP23017_IO::readGPIOB() { return readRegisterSafe(GPIOB); }
+
 bool MCP23017_IO::readPinB(uint8_t pin) {
     if (!initialized || pin >= MAX_INPUTS) return false;
-    uint8_t value = readRegister(GPIOB);
-    return (value & (1 << pin)) == 0;  // LOW = activo (pull-up)
+    return (readGPIOB() & (1 << pin)) == 0;
 }
 
-uint8_t MCP23017_IO::readGPIOB() {
-    if (!initialized) return 0;
-    return readRegister(GPIOB);
-}
+uint8_t MCP23017_IO::readAllInputs() { return readGPIOB(); }
+
+bool MCP23017_IO::readInput(uint8_t inputNum) { return readPinB(inputNum); }
 
 String MCP23017_IO::getInputsStatus() {
-    String status = "Entradas: ";
-    uint8_t inputs = readGPIOB();
-    
+    String s = "Entradas: ";
+    uint8_t vals = readGPIOB();
     for (int i = 0; i < MAX_INPUTS; i++) {
-        bool state = (inputs & (1 << i)) == 0;  // Invertido por pull-up
-        status += String(i + 1) + ":" + (state ? "ACT " : "INACT ");
+        bool state = (vals & (1 << i)) == 0;
+        s += String(i+1) + ":" + (state ? "ACT " : "INACT ");
     }
-    return status;
-}
-
-void MCP23017_IO::setDebounceTime(uint16_t ms) {
-    debounceTime = ms;
-    Serial.printf("Tiempo debounce configurado: %d ms\n", ms);
-}
-
-void MCP23017_IO::startInputMonitoring() {
-    monitoringEnabled = true;
-    Serial.println("Monitor de entradas ACTIVADO");
-    Serial.println("Enviar 'INPUT_MONITOR' nuevamente para detener");
-}
-
-void MCP23017_IO::stopInputMonitoring() {
-    monitoringEnabled = false;
-    Serial.println("Monitor de entradas DESACTIVADO");
-}
-
-bool MCP23017_IO::isMonitoring() {
-    return monitoringEnabled;
-}
-
-// --- Funciones adicionales ---
-uint8_t MCP23017_IO::readAllInputs() {
-    return readGPIOB();
-}
-
-bool MCP23017_IO::readInput(uint8_t inputNum) {
-    return readPinB(inputNum);
+    return s;
 }
 
 void MCP23017_IO::enableInputPullups(bool enable) {
@@ -202,18 +180,43 @@ void MCP23017_IO::enableInputPullups(bool enable) {
     Serial.printf("Pull-ups %s\n", enable ? "HABILITADOS" : "DESHABILITADOS");
 }
 
-// --- Funciones privadas de bajo nivel ---
-void MCP23017_IO::writeRegister(uint8_t reg, uint8_t value) {
-    Wire.beginTransmission(_addr);
-    Wire.write(reg);
-    Wire.write(value);
-    Wire.endTransmission();
+// --- Debug ---
+void MCP23017_IO::debugInputs() {
+    if (!initialized) {
+        Serial.println("[MCP DEBUG] ❌ MCP23017 no inicializado");
+        return;
+    }
+
+    uint8_t vals = readGPIOB();
+    Serial.println("=== [MCP23017 DEBUG] ===");
+    Serial.print("GPIOB: ");
+    for (int i = 7; i >= 0; i--) Serial.print((vals >> i) & 1);
+    Serial.print(" | Hex: 0x"); Serial.println(vals, HEX);
+
+    for (int i = 0; i < MAX_INPUTS; i++) {
+        bool state = (vals & (1 << i)) == 0;
+        Serial.printf("Pin B%d: %s\n", i, state ? "PRESIONADO" : "LIBRE");
+    }
+    Serial.println("=========================");
 }
 
-uint8_t MCP23017_IO::readRegister(uint8_t reg) {
-    Wire.beginTransmission(_addr);
-    Wire.write(reg);
-    if (Wire.endTransmission(false) != 0) return 0xFF;
-    Wire.requestFrom(_addr, (uint8_t)1);
-    return Wire.available() ? Wire.read() : 0xFF;
+// --- Configuración avanzada ---
+void MCP23017_IO::setDebounceTime(uint16_t ms) { debounceTime = ms; }
+void MCP23017_IO::startInputMonitoring() { monitoringEnabled = true; }
+void MCP23017_IO::stopInputMonitoring() { monitoringEnabled = false; }
+bool MCP23017_IO::isMonitoring() { return monitoringEnabled; }
+
+void MCP23017_IO::testSequence(uint16_t delayMs) {
+    Serial.println("Iniciando secuencia de prueba de relés...");
+    setAllRelays(false);
+    delay(500);
+    for (int i = 0; i < MAX_RELAYS; i++) {
+        setRelay(i, true);
+        delay(delayMs);
+    }
+    for (int i = 0; i < MAX_RELAYS; i++) {
+        setRelay(i, false);
+        delay(delayMs);
+    }
+    Serial.println("Secuencia completada");
 }

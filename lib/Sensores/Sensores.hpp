@@ -6,30 +6,27 @@
 #include "Calibracion.hpp"
 #include "GlobalVars.hpp"
 
-extern Adafruit_ADS1115 adsLow;    // 0x48 - 4 canales single-ended
-extern Adafruit_ADS1115 adsHigh;   // 0x49 - 2 canales diferenciales
+extern Adafruit_ADS1115 adsLow;   // 0x48
+extern Adafruit_ADS1115 adsHigh;  // 0x49
+extern SemaphoreHandle_t i2cMutex;
+const int POT_READ_INTERVAL_MS = 100;
 
-// Variables para potenciómetro
 extern volatile int potPercentage;
 extern volatile float potVoltage;
 extern volatile float CurrentSensorVoltage;
+extern volatile float adcChannels[6];
 
-// Constantes
-extern const int maxPotVoltage;
-extern const int minPotVoltage;
-extern const int POT_READ_INTERVAL_MS;
-
-// Nuevas variables para múltiples canales
-extern volatile float adcChannels[6]; // 4 single-ended + 2 differential
-
-// Funciones para lectura de sensores
-float readAveraged(Adafruit_ADS1115 &ads, uint8_t channel, bool differential, float lsb_mV, int samples = 4);
-void readCurrentSafe();
+// Funciones de sensores
 void readPotenciometerSafe();
+void readCurrentSafe();
 void readAllChannelsSafe();
-
-// Funciones para lectura raw de cada canal
 float readRawSingleEnded(uint8_t channel);
 float readRawDifferential(uint8_t pairIndex);
+float readAveraged(Adafruit_ADS1115 &ads, uint8_t channel, bool differential, float lsb_mV, int samples);
+
+
+// Mutex helpers (implementados en main.cpp)
+bool takeI2CMutex(uint32_t timeoutMs);
+void giveI2CMutex();
 
 #endif
