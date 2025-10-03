@@ -84,7 +84,7 @@ float Sensores::readAveraged(Adafruit_ADS1115& ads, uint8_t channel, bool differ
             raw = ads.readADC_SingleEnded(channel);
         }
         sum += raw;
-        if (i < samples - 1) delay(1); // Pequeño delay entre lecturas, pero no después de la última
+        if (i < samples - 1) delay(1); // Pequeño delay entre lecturas
     }
     
     float average = (float)sum / samples;
@@ -93,13 +93,12 @@ float Sensores::readAveraged(Adafruit_ADS1115& ads, uint8_t channel, bool differ
 
 // 🎯 LECTURA OPTIMIZADA PARA EL SISTEMA EN TIEMPO REAL
 bool Sensores::readAllSensors(float* results, uint8_t numChannels) {
-    // ⚡ VERIFICAR SI EL MUTEX ESTÁ BLOQUEADO
     if (xSemaphoreGetMutexHolder(i2cMutex) != NULL) {
-        Serial.println("🚨 ERROR: Mutex ya estaba tomado en readAllSensors!");
+        //Serial.println("🚨 ERROR: Mutex ya estaba tomado en readAllSensors!");
         return false;
     }
     
-    if (!takeI2CMutex(10)) { // ⚡ Timeout MUY corto
+    if (!takeI2CMutex(200)) { 
         Serial.println("❌ Timeout crítico en readAllSensors");
         return false;
     }
@@ -107,7 +106,6 @@ bool Sensores::readAllSensors(float* results, uint8_t numChannels) {
     uint32_t startTime = micros();
     bool success = true;
 
-    // ⚡ LECTURA CON PROTECCIÓN MÁXIMA
     bool lowOK = false, highOK = false;
     
     // Verificar dispositivos rápidamente
@@ -118,7 +116,6 @@ bool Sensores::readAllSensors(float* results, uint8_t numChannels) {
     highOK = (Wire.endTransmission() == 0);
     
     if (lowOK) {
-        // Solo leer si el dispositivo responde
         int16_t potRaw = adsLow.readADC_SingleEnded(POT_CHANNEL);
         voltage = (potRaw * 0.1875) / 1000.0;
         potPercentageLocal = constrain((voltage / 3.3) * 100.0, 0, 100);
@@ -162,7 +159,7 @@ bool Sensores::readAllSensors(float* results, uint8_t numChannels) {
 }
 
 float Sensores::readADSChannel(uint8_t adsIndex, uint8_t channel, bool differential) {
-    if (!takeI2CMutex(50)) {
+    if (!takeI2CMutex(100)) {
         Serial.println("❌ [Sensores] Timeout en readADSChannel");
         return 0.0;
     }
@@ -182,9 +179,7 @@ float Sensores::applyCalibration(float rawValue, float offset, float gain) {
     return (rawValue - offset) * gain;
 }
 
-// 📈 MÉTODOS ORIGINALES (optimizados)
 void Sensores::readPotenciometer() {
-    // Ahora se hace en readAllSensors, mantener por compatibilidad
     if (!takeI2CMutex(30)) return;
     
     float rawVoltage = readSingle(adsLow, POT_CHANNEL, false, 0.1875);
@@ -197,7 +192,6 @@ void Sensores::readPotenciometer() {
 }
 
 void Sensores::readCurrent() {
-    // Ahora se hace en readAllSensors, mantener por compatibilidad
     if (!takeI2CMutex(30)) return;
     
     for (int dev = 0; dev < NUM_DEVICES; dev++) {
@@ -216,7 +210,6 @@ void Sensores::readCurrent() {
 }
 
 void Sensores::readAllChannels() {
-    // ⚡ USAR EL NUEVO MÉTODO OPTIMIZADO
     readAllSensors(nullptr, 0);
 }
 
@@ -252,12 +245,10 @@ void Sensores::calibrateCurrent(uint8_t device, bool highRange, float knownCurre
     }
     
     if (highRange) {
-        // Calcular nuevo gain
         if (knownCurrent != 0) {
             gainCurrentHigh[device] = knownCurrent / (rawValue - offsetCurrentHigh[device]);
         }
     } else {
-        // Para calibración de offset, knownCurrent debería ser 0
         if (knownCurrent == 0) {
             offsetCurrentLow[device] = rawValue;
         }
@@ -270,11 +261,9 @@ void Sensores::calibrateCurrent(uint8_t device, bool highRange, float knownCurre
 }
 
 void Sensores::saveCalibration() {
-    // Implementar guardado en EEPROM o SPIFFS
     Serial.println("💾 Guardando calibración...");
 }
 
 void Sensores::loadCalibration() {
-    // Implementar carga desde EEPROM o SPIFFS  
     Serial.println("📂 Cargando calibración...");
 }
