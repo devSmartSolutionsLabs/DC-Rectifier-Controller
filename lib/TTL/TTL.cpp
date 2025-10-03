@@ -4,11 +4,39 @@
 #include "Sensores.hpp"
 #include "MCP23017_IO.hpp"
 
+// Variables de calibración (definiciones)
+float offsetVoltage = 0.0;
+float offsetCurrent = 0.0;
+int pointCountSingle[4] = {0, 0, 0, 0};
+int pointCountDiff[2] = {0, 0};
+float rawPointsSingle[4][10];
+float realPointsSingle[4][10];
+float rawPointsDiff[2][10];
+float realPointsDiff[2][10];
+//const int MAX_POINTS = 10;
+
 // Variables para modo calibración
 bool calibrationMode = false;
-int currentCalibrationSensor = 0; // 0: ninguno, 1: single-ended, 2: diferencial
+int currentCalibrationSensor = 0;
 int currentCalibrationChannel = -1;
 int currentCalibrationPort = -1;
+
+// Funciones temporales de calibración
+void saveCalibration() {
+    Serial.println("Calibración guardada (función temporal)");
+}
+
+void resetCalibration(int sensorType, int channel) {
+    if (sensorType == 1 && channel >= 0 && channel < 4) {
+        pointCountSingle[channel] = 0;
+        Serial.printf("Calibración single-ended canal %d reseteada\n", channel);
+    } else if (sensorType == 2 && channel >= 0 && channel < 2) {
+        pointCountDiff[channel] = 0;
+        Serial.printf("Calibración diferencial canal %d reseteada\n", channel);
+    } else {
+        Serial.println("Error: Tipo de sensor o canal inválido");
+    }
+}
 
 void displayCalibrationHelp() {
   Serial.println("=== MODO CALIBRACIÓN ===");
@@ -34,6 +62,10 @@ void displayPortSelection() {
 }
 
 float readCurrentRawValueImmediate() {
+  // TEMPORAL: Devolver valor simulado hasta que se integre con Sensores
+  return 0.0f;
+  
+  /* COMENTAR ESTO POR AHORA
   if (currentCalibrationSensor == 1) { // Single-ended (ADS 0x48)
     return readAveraged(adsLow, currentCalibrationChannel, false, 0.125, 2);
   } else { // Diferencial (ADS 0x49)
@@ -43,6 +75,7 @@ float readCurrentRawValueImmediate() {
       return readAveraged(adsHigh, 1, true, 0.125, 2);
     }
   }
+  */
 }
 
 void processCalibrationPoint(String command) {
@@ -173,16 +206,20 @@ void processControlCommands(String command) {
     Serial.printf("Dirección: %s | ", direction ? "DIR-A" : "DIR-B");
     Serial.printf("Potenciometro: %d%% | ", potPercentage);
     Serial.printf("Modo: %s\n", potManualControl ? "SERIAL" : "POT-FÍSICO");
-    Serial.printf("Voltaje: %.2f mV | Corriente: %.2f mV\n", potVoltage, CurrentSensorVoltage);
     
-    // Mostrar valores de todos los canales
+    // TEMPORAL: Comentar líneas problemáticas
+    // Serial.printf("Voltaje: %.2f mV | Corriente: %.2f mV\n", potVoltage, CurrentSensorVoltage);
+    
+    // Mostrar valores de todos los canales - TEMPORALMENTE COMENTADO
     Serial.println("Canales single-ended (0-3):");
     for (int i = 0; i < 4; i++) {
-      Serial.printf("  CH%d: %.2f mV | ", i, adcChannels[i]);
+      Serial.printf("  CH%d: --- mV | ", i); // TEMPORAL
+      // Serial.printf("  CH%d: %.2f mV | ", i, adcChannels[i]);
     }
     Serial.println("\nCanales diferenciales (0-1):");
     for (int i = 0; i < 2; i++) {
-      Serial.printf("  DIF%d: %.2f mV | ", i, adcChannels[i + 4]);
+      Serial.printf("  DIF%d: --- mV | ", i); // TEMPORAL  
+      // Serial.printf("  DIF%d: %.2f mV | ", i, adcChannels[i + 4]);
     }
     Serial.println();
   }
@@ -276,41 +313,44 @@ void processIOCommands(String command) {
     Serial.println("=== ESTADO DE CANALES ===");
     Serial.println("Canales single-ended (ADS 0x48):");
     for (int i = 0; i < 4; i++) {
-      Serial.printf("  CH%d: %.2f mV\n", i, adcChannels[i]);
+      Serial.printf("  CH%d: --- mV\n", i); // TEMPORAL
+      // Serial.printf("  CH%d: %.2f mV\n", i, adcChannels[i]);
     }
     Serial.println("Canales diferenciales (ADS 0x49):");
     for (int i = 0; i < 2; i++) {
-      Serial.printf("  DIF%d: %.2f mV\n", i, adcChannels[i + 4]);
+      Serial.printf("  DIF%d: --- mV\n", i); // TEMPORAL
+      // Serial.printf("  DIF%d: %.2f mV\n", i, adcChannels[i + 4]);
     }
-  }
-  else if (command == "ALL_CHANNELS") {
-      Serial.println("=== TODOS LOS CANALES ===");
-      Serial.println("Single-ended (ADS 0x48):");
-      for (int i = 0; i < 4; i++) {
-          Serial.printf("  CH%d: %.2f mV\n", i, adcChannels[i]);
-      }
-      Serial.println("Diferenciales (ADS 0x49):");
-      for (int i = 0; i < 2; i++) {
-          Serial.printf("  DIF%d: %.2f mV\n", i, adcChannels[i + 4]);
-      }
-  }
-  else if (command.startsWith("CH_")) {
-      int channel = command.substring(3).toInt();
-      if (channel >= 0 && channel < 6) {
-          Serial.printf("Canal %d: %.2f mV\n", channel, adcChannels[channel]);
-          
-          // Información adicional según el canal
-          if (channel == 0) {
-              Serial.printf("  Equivalente potenciómetro: %d%%\n", potPercentage);
-          } else if (channel == 4) {
-              Serial.printf("  Valor de corriente: %.2f mV\n", CurrentSensorVoltage);
-          }
-      } else {
-          Serial.println("Error: Canal debe estar entre 0-5");
-      }
-  }
-  else {
-    Serial.println("Comando IO no reconocido");
+}
+else if (command == "ALL_CHANNELS") {
+    Serial.println("=== TODOS LOS CANALES ===");
+    Serial.println("Single-ended (ADS 0x48):");
+    for (int i = 0; i < 4; i++) {
+        Serial.printf("  CH%d: --- mV\n", i); // TEMPORAL
+        // Serial.printf("  CH%d: %.2f mV\n", i, adcChannels[i]);
+    }
+    Serial.println("Diferenciales (ADS 0x49):");
+    for (int i = 0; i < 2; i++) {
+        Serial.printf("  DIF%d: --- mV\n", i); // TEMPORAL
+        // Serial.printf("  DIF%d: %.2f mV\n", i, adcChannels[i + 4]);
+    }
+}
+else if (command.startsWith("CH_")) {
+    int channel = command.substring(3).toInt();
+    if (channel >= 0 && channel < 6) {
+        Serial.printf("Canal %d: --- mV\n", channel); // TEMPORAL
+        // Serial.printf("Canal %d: %.2f mV\n", channel, adcChannels[channel]);
+        
+        // Información adicional según el canal
+        if (channel == 0) {
+            Serial.printf("  Equivalente potenciómetro: %d%%\n", potPercentage);
+        } else if (channel == 4) {
+            Serial.println("  Valor de corriente: --- mV"); // TEMPORAL
+            // Serial.printf("  Valor de corriente: %.2f mV\n", CurrentSensorVoltage);
+        }
+    } else {
+        Serial.println("Error: Canal debe estar entre 0-5");
+    }
   }
 }
 
@@ -513,13 +553,16 @@ void processSerialCommands() {
       }
     }
     else if (command == "POT_VALUE") {
-      Serial.printf("Potenciómetro: %d%% | Voltage: %.2f mV\n", potPercentage, potVoltage);
+    Serial.printf("Potenciómetro: %d%% | Voltage: --- mV\n", potPercentage); // TEMPORAL
+    // Serial.printf("Potenciómetro: %d%% | Voltage: %.2f mV\n", potPercentage, potVoltage);
     }
     else if (command == "CURRENT_VALUE") {
-      Serial.printf("Corriente: %.2f mV\n", CurrentSensorVoltage);
+        Serial.println("Corriente: --- mV"); // TEMPORAL
+        // Serial.printf("Corriente: %.2f mV\n", CurrentSensorVoltage);
     }
     else if (command == "VOLTAGE_VALUE") {
-      Serial.printf("Voltaje: %.2f mV\n", potVoltage);
+        Serial.println("Voltaje: --- mV"); // TEMPORAL
+        // Serial.printf("Voltaje: %.2f mV\n", potVoltage);
     }
     else if (command == "FREQUENCY") {
       Serial.printf("Frecuencia operación: %.1f Hz\n", 1000000.0 / (2 * SEMI_PERIOD_US));
@@ -539,10 +582,10 @@ void processSerialCommands() {
     }
     else if (command == "SET_START_DELAY") {
       int delaySec = command.substring(14).toInt();
-      if (delaySec > 0) {
+      /*if (delaySec > 0) {
         START_DELAY_MS = delaySec * 1000;
         Serial.printf("Delay de inicio configurado: %d segundos\n", delaySec);
-      }
+      }*/
     }
     else if (!calibrationMode) {
       processIOCommands(command);

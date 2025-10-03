@@ -1,25 +1,27 @@
-// GlobalVars.cpp
 #include "GlobalVars.hpp"
 
-esp_timer_handle_t startDelayTimer = nullptr;
+// ================== DEFINICIÓN DE MUTEX Y COLAS ==================
 QueueHandle_t i2cQueue = nullptr;
-SemaphoreHandle_t i2cMutex = NULL;
+SemaphoreHandle_t i2cMutex = nullptr;
+esp_timer_handle_t startDelayTimer = nullptr;
 
-// Definiciones ÚNICAS de todas las variables globales
-volatile bool potManualControl = false;
-volatile int manualPotPercentage = 50;
+// ================== DEFINICIÓN DE VARIABLES DE CONTROL ==================
+volatile bool systemStarted = false;
 volatile bool startRequested = false;
 volatile uint32_t startRequestTime = 0;
-volatile uint32_t START_DELAY_MS = 3000;
 volatile bool testMode = false;
-volatile bool systemStarted = false;
 volatile bool direction = false;
-bool ioControlEnabled = false; 
 
-// GlobalVars.cpp - AGREGAR estas variables
+// ================== DEFINICIÓN DE VARIABLES DE POTENCIA ==================
+volatile uint32_t potPercentage = 0;  // ✅ AGREGADA - inicializada en 0
+volatile bool potManualControl = false;
+volatile int manualPotPercentage = 50;
+
+// ================== DEFINICIÓN DE VARIABLES DE SCRs ==================
 volatile bool scrEnabled[NUM_DEVICES] = {true, true, true}; // Todos activos por defecto
 volatile int activeSCRsCount = 3; // Contador de SCRs activos
 
-// ✅ ELIMINAR estas líneas porque ahora son #define
-// const int NUM_DEVICES = 3;
-// const int SEMI_PERIOD_US = 8333;
+// ================== DEFINICIÓN DE VARIABLES DE ESTADO ==================
+volatile bool interruptsEnabled = true;
+volatile bool pwmGenerationEnabled = true;
+bool ioControlEnabled = false;

@@ -4,7 +4,7 @@
 #include <Arduino.h>
 #include "GlobalVars.hpp"
 
-// Variables para modo calibración
+// Variables para modo calibración (solo declaración extern)
 extern bool calibrationMode;
 extern int currentCalibrationSensor;
 extern int currentCalibrationPort;
@@ -17,7 +17,10 @@ float readCurrentRawValueImmediate();
 void processCalibrationPoint(String command);
 
 // Declarar la función forceTurnOffSCR para que esté disponible
-void forceTurnOffSCR(uint8_t dev);  // ← AÑADIR ESTA LÍNEA
-// Agregar esta declaración en TTL.hpp
+void forceTurnOffSCR(uint8_t dev);
+
+// Agregar estas declaraciones que faltan
 void processControlCommands(String command);
+void processIOCommands(String command);
+
 #endif

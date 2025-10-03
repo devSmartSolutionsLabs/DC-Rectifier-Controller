@@ -6,6 +6,26 @@
 #include <freertos/semphr.h>
 #include "esp_timer.h"
 
+// ================== CONSTANTES DE COMPILACIÓN ==================
+#define NUM_DEVICES 3
+#define SEMI_PERIOD_US 8333
+#define DEBOUNCE_TIME_US 200
+#define START_DELAY_MS 3000
+
+// Umbrales para activación progresiva de SCRs
+#define SCR_1_PHASE_THRESHOLD 33    // 0-33%: 1 SCR activo
+#define SCR_2_PHASE_THRESHOLD 66    // 34-66%: 2 SCRs activos
+// Más de 66%: 3 SCRs activos
+
+// Direcciones I2C
+#define ADS1115_ADDRESS_LOW 0x48
+#define ADS1115_ADDRESS_HIGH 0x49
+
+// Canales ADS1115
+#define POT_CHANNEL 0
+constexpr uint8_t CURRENT_CHANNELS[NUM_DEVICES] = {1, 2, 0}; // Ajusta según tu configuración
+
+// ================== ESTRUCTURAS ==================
 enum I2CDeviceType { DEV_ADS1115, DEV_MCP23017 };
 
 struct I2CRequest {
@@ -18,40 +38,34 @@ struct I2CRequest {
     bool isWrite;
 };
 
+// ================== DECLARACIONES EXTERNAS ==================
+// Mutex y Colas
 extern QueueHandle_t i2cQueue;
-extern SemaphoreHandle_t i2cMutex;  // declaración para otros archivos
+extern SemaphoreHandle_t i2cMutex;
 
-// Función segura para tomar mutex
-bool takeI2CMutex(TickType_t timeout = pdMS_TO_TICKS(100));
-void giveI2CMutex();
+// Timers
+extern esp_timer_handle_t startDelayTimer;
 
-// ✅ Cambiar constantes a #define para tiempo de compilación
-constexpr int NUM_DEVICES = 3;
-constexpr int SEMI_PERIOD_US = 8333;
-constexpr int DEBOUNCE_TIME_US = 200;
+// Variables de control del sistema
+extern volatile bool systemStarted;
+extern volatile bool startRequested;
+extern volatile uint32_t startRequestTime;
+extern volatile bool testMode;
+extern volatile bool direction;
 
-// Nuevas constantes para activación progresiva de SCRs
-constexpr int SCR_1_PHASE_THRESHOLD = 0;    // 0-5%: 1 SCR activo
-constexpr int SCR_2_PHASE_THRESHOLD = 1;   // 5-10%: 2 SCRs activos
-// Más de 10%: 3 SCRs activos
+// Variables de control de potencia
+extern volatile uint32_t potPercentage;  // ✅ AGREGADA - falta en tu código
+extern volatile bool potManualControl;
+extern volatile int manualPotPercentage;
 
-// Variables para control de SCRs activos
+// Variables de control de SCRs
 extern volatile bool scrEnabled[NUM_DEVICES];
 extern volatile int activeSCRsCount;
 
-// Declaraciones extern de todas las variables globales
-extern volatile bool potManualControl;
-extern volatile int manualPotPercentage;
-extern volatile bool startRequested;
-extern volatile uint32_t startRequestTime;
-extern esp_timer_handle_t startDelayTimer;
-extern volatile uint32_t START_DELAY_MS;
-extern volatile bool testMode;
-extern volatile bool systemStarted;
-extern volatile bool direction;
-extern bool ioControlEnabled;  
+// Variables de estado
 extern volatile bool interruptsEnabled;
 extern volatile bool pwmGenerationEnabled;
+extern bool ioControlEnabled;
 
 
 #endif

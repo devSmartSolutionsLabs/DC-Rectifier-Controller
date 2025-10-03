@@ -25,7 +25,7 @@ public:
     MCP23017_IO(uint8_t address = MCP23017_ADDRESS);
 
     // Inicialización
-    bool begin(uint8_t sda, uint8_t scl);
+    bool begin(uint8_t sda, uint8_t scl, uint8_t address = MCP23017_ADDRESS);
     bool isInitialized();
 
     // Relés (Puerto A)
@@ -66,6 +66,7 @@ private:
     uint8_t readRegister(uint8_t reg);
     uint8_t readRegisterSafe(uint8_t reg);
     void writeRegister(uint8_t reg, uint8_t value);
+    bool writeRegisterSafe(uint8_t reg, uint8_t value); // ✅ AGREGAR esta función
 
     // Configuración de puertos
     void setPortADirection(uint8_t dir);
@@ -74,6 +75,8 @@ private:
     void setPullupsB(uint8_t mask);
     void writeGPIOA(uint8_t value);
     void writePinA(uint8_t pin, bool state);
+
+    bool tryReadInputs(uint8_t* result);
 };
  
 // Instancia global
