@@ -9,7 +9,6 @@
 #include "mutexDebug.hpp"
 
 // ================== Variables Globales ==================
-
 QueueHandle_t zcQueues[NUM_DEVICES] = {NULL, NULL, NULL};
 esp_timer_handle_t fireTimers[NUM_DEVICES];
 
@@ -33,6 +32,7 @@ bool startButtonDetected = false;
 bool lastStartButtonState = false;
 uint32_t startButtonPressTime = 0;
 bool startCounting = false;
+
 // ================== WRAPPERS PARA I2C MANAGER ==================
 float readADSSafe(uint8_t address, uint8_t channel) {
     Adafruit_ADS1115* ads = nullptr;
@@ -56,11 +56,10 @@ uint8_t readMCP23017Safe(uint8_t address, uint8_t reg) {
     if (reg == 0x13) {  // GPIOB
         return ioController.readGPIOB();
     }
-    // Si necesitas otro registro, agrega más condiciones
     return 0xFF;  // default si registro no soportado
 }
-// ================== FUNCIONES ==================
 
+// ================== FUNCIONES ==================
 void IRAM_ATTR forceTurnOffSCR(uint8_t dev) {
     gpio_set_level((gpio_num_t)scrPins[dev], 0);
     scrActive[dev] = false;
@@ -201,9 +200,6 @@ void i2cManagerTask(void *pvParameters) {
     I2CRequest req;
     for (;;) {
         if (xQueueReceive(i2cQueue, &req, portMAX_DELAY) == pdTRUE) {
-            Serial.printf("🔧 i2cManager: Procesando request - Device: %d, Reg: 0x%02X\n", 
-                         req.device, req.reg);
-            
             switch (req.device) {
                 case DEV_ADS1115:
                     if (!req.isWrite && req.resultF) {
@@ -222,169 +218,70 @@ void i2cManagerTask(void *pvParameters) {
                     }
                     break;
             }
-            
-            Serial.printf("🔧 i2cManager: Request completado\n");
         }
     }
 }
 
 void handleInputChange(uint8_t inputNumber, bool state) {
-    Serial.printf("🎯 handleInputChange: Entrada %d -> %s\n", 
-                 inputNumber + 1, 
-                 state ? "ACTIVA" : "INACTIVA");
-    
-    // Ejemplo de acciones según la entrada
     switch(inputNumber) {
-        case 0: // Entrada 1
+        case 0: // START
             if (state) {
-                Serial.println("✅ Entrada 1 activada - Acción específica");
-                // ioController.setRelay(0, true); // Ejemplo: activar relé 0
+                Serial.println("🎯 START presionado, iniciando conteo 3s...");
+                startRequested = true;
+                startRequestTime = millis();
             } else {
-                Serial.println("❌ Entrada 1 desactivada");
-                // ioController.setRelay(0, false);
+                Serial.println("🛑 START liberado, apagando sistema");
+                startRequested = false;
+                systemStarted = false;
+                ioController.setRelay(0, false);
             }
             break;
-            
-        case 1: // Entrada 2
+        
+        case 1: // Botón DIRECCIÓN
             if (state) {
-                Serial.println("✅ Entrada 2 activada - Alternar relé");
-                // ioController.toggleRelay(1);
+                direction = true;  // Presionado = DIRECTA
+                ioController.setRelay(1, true);   // encender relé 2
+                Serial.println("🔄 Dirección: DIRECTA (Relé 2 ON)");
+            } else {
+                direction = false; // Suelto = INVERSA
+                ioController.setRelay(1, false);  // apagar relé 2
+                Serial.println("🔄 Dirección: INVERSA (Relé 2 OFF)");
             }
             break;
-            
-        case 2: // Entrada 3
-            // Tu lógica para entrada 3
-            break;
-            
-        case 3: // Entrada 4
-            // Tu lógica para entrada 4
-            break;
-            
-        // ... añadir más casos según necesites
-            
+
         default:
-            Serial.printf("⚠️ Entrada %d no configurada\n", inputNumber + 1);
+            Serial.printf("Entrada %d cambio a %s\n", 
+                          inputNumber+1, state ? "ACTIVA":"INACTIVA");
             break;
     }
 }
 
-// ========== LECTURA DIGITAL + BOTÓN START ==========
+// ========== LECTURA DIGITAL ==========
 void processInputChanges(uint8_t currentStates) {
     static uint8_t lastStates = 0xFF;
     static uint32_t lastDebounceTime = 0;
     
     if (currentStates == lastStates) return;
-    
-    // Debounce simple
     if (millis() - lastDebounceTime < 50) return;
-    
     lastDebounceTime = millis();
     
-    // Detectar cambios
     for (int i = 0; i < 8; i++) {
         bool currentState = (currentStates & (1 << i)) == 0;
         bool lastState = (lastStates & (1 << i)) == 0;
-        
         if (currentState != lastState) {
-            Serial.printf("🔄 Entrada %d: %s -> %s\n", 
-                         i + 1, 
-                         lastState ? "ACTIVA" : "INACTIVA",
-                         currentState ? "ACTIVA" : "INACTIVA");
-            
-            // Aquí tu lógica de acciones para cambios de entrada
             handleInputChange(i, currentState);
         }
     }
-    
     lastStates = currentStates;
 }
 
-
-
-// ================== DIGITAL INPUT TASK CORREGIDA ==================
+// ================== DIGITAL INPUT TASK ==================
 void digitalInputTask(void* parameter) {
-    const TickType_t xFrequency = pdMS_TO_TICKS(50);
+    const TickType_t xFrequency = pdMS_TO_TICKS(100);
     TickType_t xLastWakeTime = xTaskGetTickCount();
-    
-    uint32_t totalFails = 0;
-    uint32_t lastSuccessTime = millis();
-    uint32_t lastErrorLog = 0;
-
     while (true) {
-        uint8_t inputStates = 0xFF;
-        bool success = false;
-
-        // ⚡ INTENTAR LECTURA DIRECTA CON MUTEX
-        if (takeI2CMutex(25)) { // Timeout de 25ms
-            uint32_t readStart = micros();
-            
-            // LECTURA DIRECTA ULTRA RÁPIDA
-            Wire.beginTransmission(MCP23017_ADDRESS);
-            Wire.write(0x13); // GPIOB
-            if (Wire.endTransmission() == 0) {
-                uint8_t bytes = Wire.requestFrom((uint16_t)MCP23017_ADDRESS, (uint8_t)1);
-                if (bytes > 0 && Wire.available()) {
-                    inputStates = Wire.read();
-                    success = true;
-                    totalFails = 0;
-                    lastSuccessTime = millis();
-                }
-            }
-            
-            giveI2CMutex();
-            
-            if (success) {
-                processInputChanges(inputStates);
-            } else {
-                totalFails++;
-            }
-        } else {
-            totalFails++;
-        }
-
-        // 📊 LOGGING INTELIGENTE
-        if (totalFails > 0) {
-            if (millis() - lastErrorLog > 3000) { // Log cada 3 segundos máximo
-                Serial.printf("⚠️ [Input] %lu fallos, último éxito hace %lums\n", 
-                             totalFails, millis() - lastSuccessTime);
-                lastErrorLog = millis();
-                
-                // 🎯 DEBUG DEL MUTEX CUANDO HAY FALLOS
-                if (i2cMutex != NULL) {
-                    UBaseType_t mutexCount = uxSemaphoreGetCount(i2cMutex);
-                    TaskHandle_t mutexHolder = xSemaphoreGetMutexHolder(i2cMutex);
-                    
-                    if (mutexHolder != NULL) {
-                        Serial.printf("🔍 Mutex bloqueado por: %s\n", pcTaskGetName(mutexHolder));
-                    } else {
-                        Serial.printf("🔍 Mutex count: %d, Holder: NINGUNO\n", mutexCount);
-                    }
-                }
-            }
-            
-            // 🚨 ESTRATEGIA DE RECUPERACIÓN
-            if (totalFails >= 20) {
-                Serial.println("🚨 RESETEO DE EMERGENCIA - Reiniciando I2C");
-                
-                // FORZAR LIBERACIÓN DEL MUTEX
-                while (xSemaphoreTake(i2cMutex, 0) == pdTRUE) {
-                    xSemaphoreGive(i2cMutex);
-                }
-                
-                // REINICIAR I2C
-                Wire.end();
-                delay(50);
-                Wire.begin(5, 4);
-                Wire.setClock(100000);
-                
-                totalFails = 0;
-                vTaskDelay(pdMS_TO_TICKS(200)); // Pausa larga para recuperación
-            }
-            else if (totalFails >= 5) {
-                vTaskDelay(pdMS_TO_TICKS(10)); // Pausa corta
-            }
-        }
-
+        uint8_t inputStates = ioController.readAllInputs();
+        processInputChanges(inputStates);
         vTaskDelayUntil(&xLastWakeTime, xFrequency);
     }
 }
@@ -451,19 +348,15 @@ void controlTaskFaseC(void* param) {
     }
 }
 
-// ================== ADS READ TASK ULTRA OPTIMIZADA ==================
+// ================== ADS READ TASK ==================
 void adsReadTask(void* parameter) {
-    const TickType_t xFrequency = pdMS_TO_TICKS(1000); // ⚡ SOLO 1 VEZ POR SEGUNDO
+    const TickType_t xFrequency = pdMS_TO_TICKS(1000);
     TickType_t xLastWakeTime = xTaskGetTickCount();
-    
     while (true) {
-        // ⚡ LECTURA MÍNIMA
         bool success = sensores.readAllSensors(nullptr, 0);
-        
         if (!success) {
             Serial.println("❌ Fallo lectura ADS - Skipping ciclo");
         }
-        
         vTaskDelayUntil(&xLastWakeTime, xFrequency);
     }
 }
@@ -474,48 +367,28 @@ void setup() {
     delay(1000);
     Serial.println("=== INICIANDO SISTEMA ===");
 
-    // --- HABILITAR MCP23017 ---
-    Serial.println("🔌 Habilitando MCP23017...");
     pinMode(15, OUTPUT);
     digitalWrite(15, HIGH); 
     delay(1000);
-    Serial.println("✅ MCP23017 habilitado");
 
-    // --- INICIALIZAR I2C PRIMERO ---
     Wire.begin(5, 4);
     Wire.setClock(100000);
 
-    // --- Mutex I2C ---
     if (i2cMutex == NULL) {
         i2cMutex = xSemaphoreCreateMutex();
-        Serial.print("✅ i2cMutex creado: ");
-        Serial.println(i2cMutex != nullptr ? "SI" : "NO");
-        
-        // Dar el mutex inicialmente
         giveI2CMutex();
     }
 
-    // --- Configuración de pines SCR ---
     for (int i = 0; i < NUM_DEVICES; i++) {
         pinMode(zcPins[i], INPUT_PULLDOWN);
         pinMode(scrPins[i], OUTPUT);
         digitalWrite(scrPins[i], LOW);
         zcQueues[i] = xQueueCreate(10, sizeof(uint8_t));
-        Serial.printf("✅ zcQueue[%d] creada: %s\n", i, zcQueues[i] != nullptr ? "SI" : "NO");
     }
 
-    // --- Inicializar Sensores ---
-    Serial.println("🔍 Inicializando sensores...");
-    if (!sensores.begin()) {
-        Serial.println("❌ ERROR inicializando Sensores (ADS1115)");
-    }
+    sensores.begin();
+    ioController.begin(5,4);
 
-    // --- Inicializar MCP23017 ---
-    Serial.println("🔍 Inicializando MCP23017...");
-    bool mcpInit = ioController.begin(5,4);
-    Serial.printf("✅ MCP23017 inicializado: %s\n", mcpInit ? "SI" : "NO");
-
-    // --- ISR Zero Crossing ---
     gpio_install_isr_service(ESP_INTR_FLAG_LEVEL3);
     gpio_set_intr_type((gpio_num_t)zcPins[0], GPIO_INTR_POSEDGE);
     gpio_isr_handler_add((gpio_num_t)zcPins[0], zcISR_FaseA, NULL);
@@ -524,7 +397,6 @@ void setup() {
     gpio_set_intr_type((gpio_num_t)zcPins[2], GPIO_INTR_POSEDGE);
     gpio_isr_handler_add((gpio_num_t)zcPins[2], zcISR_FaseC, NULL);
 
-    // --- Timers SCR ---
     for (int i = 0; i < NUM_DEVICES; i++) {
         esp_timer_create_args_t fireArgs = {
             .callback = &timerCallback,
@@ -536,30 +408,50 @@ void setup() {
         esp_timer_create(&fireArgs, &fireTimers[i]);
     }
 
-    // --- Tareas PRIMERO (sin I2C Manager inicialmente) ---
     xTaskCreate(digitalInputTask, "inputTask", 4096, NULL, 1, NULL);
     xTaskCreate(controlTaskFaseA, "ctrlA", 4096, NULL, 3, NULL);
     xTaskCreate(controlTaskFaseB, "ctrlB", 4096, NULL, 3, NULL);
     xTaskCreate(controlTaskFaseC, "ctrlC", 4096, NULL, 3, NULL);
 
-    // --- Cola I2C AL FINAL ---
-    i2cQueue = xQueueCreate(5, sizeof(I2CRequest)); // Reducir tamaño
-    Serial.print("✅ i2cQueue creada: ");
-    Serial.println(i2cQueue != nullptr ? "SI" : "NO");
-
-    // --- Tareas I2C DESPUÉS de crear la cola ---
+    i2cQueue = xQueueCreate(5, sizeof(I2CRequest));
     xTaskCreate(i2cManagerTask, "I2C Manager", 4096, NULL, 2, NULL);
     xTaskCreate(adsReadTask, "ADS Read Task", 4096, NULL, 3, NULL);
 
     Serial.println("=== SETUP COMPLETADO ===");
-    
-    // Verificar estado final
-    UBaseType_t mutexCount = uxSemaphoreGetCount(i2cMutex);
-    Serial.printf("🔍 Mutex disponibles al final: %d\n", mutexCount);
 }
+
 // ================== LOOP ==================
 void loop() {
     processSerialCommands();
     updateSCREnabledStates(sensores.getPotPercentage());
+
+    // START con retardo de 3 segundos
+    if (startRequested && !systemStarted) {
+        if (millis() - startRequestTime >= 3000) {
+            systemStarted = true;
+            startRequested = false;
+            ioController.setRelay(0, true);
+            Serial.println("✅ Sistema iniciado, relé ON");
+        }
+    }
+
+    static uint32_t lastLog = 0;
+    if (millis() - lastLog > 1000) {
+        lastLog = millis();
+        float v = sensores.getVoltage();
+        float pot = sensores.getPotPercentage();
+        Serial.printf("📊 Pot: %.2f%% | Vpot: %.3f V\n", pot, v);
+        for (int i = 0; i < NUM_DEVICES; i++) {
+            Serial.printf("   Corriente[%d]: %.3f A\n", i, sensores.getCurrent(i));
+        }
+        uint8_t inputs = ioController.readAllInputs(); 
+        Serial.print("🔘 Botones: ");
+        for (int i = 0; i < 8; i++) {
+            bool pressed = (inputs & (1 << i)) == 0;
+            Serial.printf("[%d:%s] ", i, pressed ? "ON" : "OFF");
+        }
+        Serial.println();
+    }
+
     vTaskDelay(50 / portTICK_PERIOD_MS);
 }
