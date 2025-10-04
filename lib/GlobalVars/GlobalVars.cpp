@@ -1,4 +1,5 @@
 #include "GlobalVars.hpp"
+bool verboseLog = false;  // false = solo mensajes importantes
 
 // ================== DEFINICIÓN DE MUTEX Y COLAS ==================
 QueueHandle_t i2cQueue = nullptr;

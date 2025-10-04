@@ -67,5 +67,7 @@ extern volatile bool interruptsEnabled;
 extern volatile bool pwmGenerationEnabled;
 extern bool ioControlEnabled;
 
+extern bool verboseLog;  // false = solo mensajes importantes
+
 
 #endif
