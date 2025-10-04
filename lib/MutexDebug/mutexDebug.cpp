@@ -12,7 +12,7 @@ bool takeI2CMutex(TickType_t timeout, const char* caller) {
     
     UBaseType_t available = uxSemaphoreGetCount(i2cMutex);
     if (available == 0) {
-        Serial.printf("⚠️ [%s] Mutex ocupado por: %s. Esperando...\n", caller, currentHolder);
+        if (verboseLog)  Serial.printf("⚠️ [%s] Mutex ocupado por: %s. Esperando...\n", caller, currentHolder);
     }
     
     BaseType_t result = xSemaphoreTake(i2cMutex, timeout);
