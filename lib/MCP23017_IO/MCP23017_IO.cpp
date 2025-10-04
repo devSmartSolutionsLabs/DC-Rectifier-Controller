@@ -18,8 +18,8 @@ MCP23017_IO::MCP23017_IO(uint8_t address) :
 
 // --- writeRegisterSafe (debe estar primero) ---
 bool MCP23017_IO::writeRegisterSafe(uint8_t reg, uint8_t value) {
-    if (!takeI2CMutex(50)) { // ✅ Timeout más corto
-        Serial.printf("❌ Timeout mutex en writeRegisterSafe 0x%02X\n", reg);
+    if (!takeI2CMutex(50,"MCP_Write")) { // ✅ Timeout más corto
+        if (verboseLog) Serial.printf("❌ Timeout mutex en writeRegisterSafe 0x%02X\n", reg);
         return false;
     }
     
@@ -68,20 +68,20 @@ bool MCP23017_IO::begin(uint8_t sdaPin, uint8_t sclPin, uint8_t address) {
         intentos++;
         
         // USAR MUTEX SOLO para la detección
-        if (takeI2CMutex(500)) {
+        if (takeI2CMutex(500,"MCP_begin")) {
             Wire.beginTransmission(_addr);
             uint8_t error = Wire.endTransmission();
             giveI2CMutex(); // ✅ LIBERAR INMEDIATAMENTE
             
             if (error == 0) {
-                Serial.printf("✅ [MCP23017] Encontrado en intento %d\n", intentos);
+                if (verboseLog) Serial.printf("✅ [MCP23017] Encontrado en intento %d\n", intentos);
                 deviceFound = true;
                 break;
             } else {
-                Serial.printf("⚠️ [MCP23017] Intento %d falló, error: %d\n", intentos, error);
+                if (verboseLog) Serial.printf("⚠️ [MCP23017] Intento %d falló, error: %d\n", intentos, error);
             }
         } else {
-            Serial.printf("❌ [MCP23017] Timeout mutex en intento %d\n", intentos);
+            if (verboseLog) Serial.printf("❌ [MCP23017] Timeout mutex en intento %d\n", intentos);
         }
         
         delay(100);
@@ -154,7 +154,7 @@ uint8_t MCP23017_IO::readRegister(uint8_t reg) {
 uint8_t MCP23017_IO::readRegisterSafe(uint8_t reg) {
     uint8_t result = 0xFF;
     
-    if (!takeI2CMutex(15)) { // ⚡ Reducido a 15ms
+    if (!takeI2CMutex(15,"MCP_Read")) { // ⚡ Reducido a 15ms
         static uint32_t lastLog = 0;
         if (millis() - lastLog > 2000) { // Log cada 2 segundos máximo
             Serial.printf("❌ Timeout mutex en readRegisterSafe 0x%02X\n", reg);
