@@ -203,7 +203,7 @@ void i2cManagerTask(void *pvParameters) {
             switch (req.device) {
                 case DEV_ADS1115:
                     if (!req.isWrite && req.resultF) {
-                        if (takeI2CMutex(100, "i2cManager-ADS")) {
+                        if (takeI2CMutex(300, "i2cManager-ADS")) {
                             *req.resultF = readADSSafe(req.address, req.reg);
                             giveI2CMutex("i2cManager-ADS");
                         }
@@ -211,7 +211,7 @@ void i2cManagerTask(void *pvParameters) {
                     break;
                 case DEV_MCP23017:
                     if (!req.isWrite && req.resultB) {
-                        if (takeI2CMutex(100, "i2cManager-MCP")) {
+                        if (takeI2CMutex(300, "i2cManager-MCP")) {
                             *req.resultB = readMCP23017Safe(req.address, req.reg);
                             giveI2CMutex("i2cManager-MCP");
                         }
@@ -229,11 +229,18 @@ void handleInputChange(uint8_t inputNumber, bool state) {
                 Serial.println("🎯 START presionado, iniciando conteo 3s...");
                 startRequested = true;
                 startRequestTime = millis();
+                
+                ioController.setRelay(1, direction);
+                Serial.printf("⚡ Dirección fijada: %s (Relé 2 %s)\n",
+                      direction ? "DIRECTA" : "INVERSA",
+                      direction ? "ON" : "OFF");
             } else {
                 Serial.println("🛑 START liberado, apagando sistema");
                 startRequested = false;
                 systemStarted = false;
                 ioController.setRelay(0, false);
+                ioController.setRelay(1, false); // apagar relé 2 también
+
             }
             break;
         
@@ -355,7 +362,9 @@ void adsReadTask(void* parameter) {
     while (true) {
         bool success = sensores.readAllSensors(nullptr, 0);
         if (!success) {
-            Serial.println("❌ Fallo lectura ADS - Skipping ciclo");
+            if (verboseLog) {
+                Serial.println("❌ Fallo lectura ADS - Skipping ciclo");
+            }
         }
         vTaskDelayUntil(&xLastWakeTime, xFrequency);
     }
@@ -435,22 +444,29 @@ void loop() {
         }
     }
 
+    static float lastPot = -1;        // último valor registrado
     static uint32_t lastLog = 0;
-    if (millis() - lastLog > 1000) {
+    
+    float v = sensores.getVoltage();
+    float pot = sensores.getPotPercentage();
+        
+    if (millis() - lastLog > 500) {
         lastLog = millis();
-        float v = sensores.getVoltage();
-        float pot = sensores.getPotPercentage();
-        Serial.printf("📊 Pot: %.2f%% | Vpot: %.3f V\n", pot, v);
+        if (fabs(pot - lastPot) >= 0.5) {
+            Serial.printf("📊 Pot: %.2f%% | Vpot: %.3f V\n", pot, v);
+            lastPot = pot;
+        }
+
         for (int i = 0; i < NUM_DEVICES; i++) {
-            Serial.printf("   Corriente[%d]: %.3f A\n", i, sensores.getCurrent(i));
+            if (verboseLog) Serial.printf("   Corriente[%d]: %.3f A\n", i, sensores.getCurrent(i));
         }
         uint8_t inputs = ioController.readAllInputs(); 
-        Serial.print("🔘 Botones: ");
+        if (verboseLog) Serial.print("🔘 Botones: ");
         for (int i = 0; i < 8; i++) {
             bool pressed = (inputs & (1 << i)) == 0;
-            Serial.printf("[%d:%s] ", i, pressed ? "ON" : "OFF");
+            if (verboseLog) Serial.printf("[%d:%s] ", i, pressed ? "ON" : "OFF");
         }
-        Serial.println();
+        if (verboseLog) Serial.println();
     }
 
     vTaskDelay(50 / portTICK_PERIOD_MS);
