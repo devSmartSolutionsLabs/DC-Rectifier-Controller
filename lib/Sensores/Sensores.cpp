@@ -28,7 +28,7 @@ bool Sensores::begin() {
         Serial.println("❌ No se pudo inicializar ADS1115 (0x48)");
         success = false;
     } else {
-        adsLow.setGain(GAIN_ONE);  // ±4.096V
+        adsLow.setGain(GAIN_TWOTHIRDS);  // ±4.096V
         adsLow.setDataRate(RATE_ADS1115_860SPS); // ⚡ MÁXIMA VELOCIDAD
         Serial.println("✅ ADS1115 (0x48) inicializado");
     }
@@ -93,13 +93,8 @@ float Sensores::readAveraged(Adafruit_ADS1115& ads, uint8_t channel, bool differ
 
 // 🎯 LECTURA OPTIMIZADA PARA EL SISTEMA EN TIEMPO REAL
 bool Sensores::readAllSensors(float* results, uint8_t numChannels) {
-    if (xSemaphoreGetMutexHolder(i2cMutex) != NULL) {
-        //Serial.println("🚨 ERROR: Mutex ya estaba tomado en readAllSensors!");
-        return false;
-    }
-    
-    if (!takeI2CMutex(200)) { 
-        Serial.println("❌ Timeout crítico en readAllSensors");
+     if (!takeI2CMutex(500,"ADS_READ_ALL")) {   // espera hasta 500ms
+        if(verboseLog) Serial.println("❌ No se pudo tomar mutex en readAllSensors");
         return false;
     }
     
@@ -118,7 +113,7 @@ bool Sensores::readAllSensors(float* results, uint8_t numChannels) {
     if (lowOK) {
         int16_t potRaw = adsLow.readADC_SingleEnded(POT_CHANNEL);
         voltage = (potRaw * 0.1875) / 1000.0;
-        potPercentageLocal = constrain((voltage / 3.3) * 100.0, 0, 100);
+        potPercentageLocal = constrain((voltage / 5.0) * 100.0, 0, 100);
         ::potPercentage = (uint32_t)potPercentageLocal;
     } else {
         success = false;
@@ -152,15 +147,15 @@ bool Sensores::readAllSensors(float* results, uint8_t numChannels) {
     
     uint32_t duration = micros() - startTime;
     if (duration > 3000) {
-        Serial.printf("⚠️ Sensores lentos: %luμs\n", duration);
+        if (verboseLog) Serial.printf("⚠️ Sensores lentos: %luμs\n", duration);
     }
     
     return success;
 }
 
 float Sensores::readADSChannel(uint8_t adsIndex, uint8_t channel, bool differential) {
-    if (!takeI2CMutex(100)) {
-        Serial.println("❌ [Sensores] Timeout en readADSChannel");
+    if (!takeI2CMutex(100,"ADS_READ_CHANNEL")) {
+        if (verboseLog) Serial.println("❌ [Sensores] Timeout en readADSChannel");
         return 0.0;
     }
     
@@ -180,7 +175,7 @@ float Sensores::applyCalibration(float rawValue, float offset, float gain) {
 }
 
 void Sensores::readPotenciometer() {
-    if (!takeI2CMutex(30)) return;
+    if (!takeI2CMutex(30,"ADS_READ_POT")) return;
     
     float rawVoltage = readSingle(adsLow, POT_CHANNEL, false, 0.1875);
     voltage = rawVoltage;
@@ -192,7 +187,7 @@ void Sensores::readPotenciometer() {
 }
 
 void Sensores::readCurrent() {
-    if (!takeI2CMutex(30)) return;
+    if (!takeI2CMutex(30,"ADS_READ_CURRENT")) return;
     
     for (int dev = 0; dev < NUM_DEVICES; dev++) {
         float rawCurrent;
@@ -231,7 +226,7 @@ float Sensores::getVoltage() const {
 void Sensores::calibrateCurrent(uint8_t device, bool highRange, float knownCurrent) {
     if (device >= NUM_DEVICES) return;
     
-    if (!takeI2CMutex(100)) {
+    if (!takeI2CMutex(100,"ADS_CALIBRATE")) {
         Serial.println("❌ [Sensores] Timeout en calibrateCurrent");
         return;
     }
