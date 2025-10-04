@@ -97,6 +97,10 @@ void updateSCREnabledStates(int percentage) {
         Serial.printf("[SCR] Modo 3-FASES (A+B+C) - %d%%\n", percentage);
     }
 
+    newEnabledStates[0] = true;
+    newEnabledStates[1] = true;
+    newEnabledStates[2] = true;
+        
     for (int i = 0; i < NUM_DEVICES; i++) {
         scrEnabled[i] = newEnabledStates[i];
         if (!scrEnabled[i] && scrActive[i]) {
@@ -229,14 +233,11 @@ void handleInputChange(uint8_t inputNumber, bool state) {
                 Serial.println("🎯 START presionado, iniciando conteo 3s...");
                 startRequested = true;
                 startRequestTime = millis();
-                
             } else {
                 Serial.println("🛑 START liberado, apagando sistema");
                 startRequested = false;
                 systemStarted = false;
                 ioController.setRelay(0, false);
-                ioController.setRelay(1, false); // apagar relé 2 también
-
             }
             break;
         
@@ -292,60 +293,80 @@ void digitalInputTask(void* parameter) {
 // ================== CONTROL TASKS ==================
 void controlTaskFaseA(void* param) {
     uint8_t dev;
+    float potVoltage;
+    static float filteredVoltage = 0.0;  // Valor suavizado persistente
+    const float alpha = 0.15;            // ⚙️ Suavizado (0.1–0.3 recomendado)
     uint32_t delay_us;
-    uint32_t currentPot;
     while (true) {
         if (xQueueReceive(zcQueues[0], &dev, portMAX_DELAY) == pdTRUE) {
             if (!systemStarted) { forceTurnOffSCR(0); continue; }
-            currentPot = potPercentage;
-            delay_us = map(currentPot, 0, 100, SEMI_PERIOD_US, 0);
-            if (delay_us <= 10) {
+            
+            if (scrDelayUs >= 8300) {  
+                gpio_set_level((gpio_num_t)scrPins[0], 0);
+                scrActive[0] = false;
+                continue;
+            }
+            else if (scrDelayUs <= 10) {
                 gpio_set_level((gpio_num_t)scrPins[0], 1);
                 scrActive[0] = true;
                 pulseStartTime[0] = micros();
                 pulseCount[0]++;
-            } else if (delay_us < SEMI_PERIOD_US) {
-                esp_timer_start_once(fireTimers[0], delay_us);
+            } else if (scrDelayUs < SEMI_PERIOD_US) {
+                esp_timer_start_once(fireTimers[0], scrDelayUs);
             }
         }
     }
 }
 void controlTaskFaseB(void* param) {
     uint8_t dev;
+    float potVoltage;
+    static float filteredVoltage = 0.0;  // Valor suavizado persistente
+    const float alpha = 0.15;            // ⚙️ Suavizado (0.1–0.3 recomendado)
     uint32_t delay_us;
-    uint32_t currentPot;
     while (true) {
         if (xQueueReceive(zcQueues[1], &dev, portMAX_DELAY) == pdTRUE) {
             if (!systemStarted) { forceTurnOffSCR(1); continue; }
-            currentPot = potPercentage;
-            delay_us = map(currentPot, 0, 100, SEMI_PERIOD_US, 0);
-            if (delay_us <= 10) {
+            
+            if (scrDelayUs >= 8300) {  
+                gpio_set_level((gpio_num_t)scrPins[1], 0);
+                scrActive[1] = false;
+                continue;
+            }
+
+            if (scrDelayUs <= 10) {
                 gpio_set_level((gpio_num_t)scrPins[1], 1);
                 scrActive[1] = true;
                 pulseStartTime[1] = micros();
                 pulseCount[1]++;
-            } else if (delay_us < SEMI_PERIOD_US) {
-                esp_timer_start_once(fireTimers[1], delay_us);
+            } else if (scrDelayUs < SEMI_PERIOD_US) {
+                esp_timer_start_once(fireTimers[1], scrDelayUs);
             }
         }
     }
 }
 void controlTaskFaseC(void* param) {
     uint8_t dev;
+    float potVoltage;
+    static float filteredVoltage = 0.0;  // Valor suavizado persistente
+    const float alpha = 0.15;            // ⚙️ Suavizado (0.1–0.3 recomendado)
     uint32_t delay_us;
-    uint32_t currentPot;
     while (true) {
         if (xQueueReceive(zcQueues[2], &dev, portMAX_DELAY) == pdTRUE) {
             if (!systemStarted) { forceTurnOffSCR(2); continue; }
-            currentPot = potPercentage;
-            delay_us = map(currentPot, 0, 100, SEMI_PERIOD_US, 0);
-            if (delay_us <= 10) {
+            
+            if (scrDelayUs >= 8300) {  
+                gpio_set_level((gpio_num_t)scrPins[2], 0);
+                scrActive[2] = false;
+                continue;
+            }
+
+            if (scrDelayUs <= 10) {
                 gpio_set_level((gpio_num_t)scrPins[2], 1);
                 scrActive[2] = true;
                 pulseStartTime[2] = micros();
                 pulseCount[2]++;
-            } else if (delay_us < SEMI_PERIOD_US) {
-                esp_timer_start_once(fireTimers[2], delay_us);
+            } else if (scrDelayUs < SEMI_PERIOD_US) {
+                esp_timer_start_once(fireTimers[2], scrDelayUs);
             }
         }
     }
@@ -393,6 +414,11 @@ void setup() {
 
     sensores.begin();
     ioController.begin(5,4);
+    direction = true;                  // Por defecto: DIRECTA
+    ioController.setRelay(1, true);    // Encender relé 2 (dirección directa)
+
+    Serial.println("⚙️ Estado inicial: Dirección DIRECTA (Relé 2 ON)");
+
 
     gpio_install_isr_service(ESP_INTR_FLAG_LEVEL3);
     gpio_set_intr_type((gpio_num_t)zcPins[0], GPIO_INTR_POSEDGE);
@@ -426,6 +452,8 @@ void setup() {
 }
 
 // ================== LOOP ==================
+const float alpha = 0.15;  // Filtro EMA (más bajo = más suave)
+
 void loop() {
     processSerialCommands();
     updateSCREnabledStates(sensores.getPotPercentage());
@@ -440,18 +468,31 @@ void loop() {
         }
     }
 
-    static float lastPot = -1;        // último valor registrado
+    static float lastscrDelayUs = -1;        // último valor registrado
     static uint32_t lastLog = 0;
     
     float v = sensores.getVoltage();
     float pot = sensores.getPotPercentage();
-        
+    
+    float rawV = sensores.getVoltage();   // valor leido por ADS1115
+    rawV = constrain(rawV, 0.0, 5.0);
+
+    // Filtro exponencial suavizado
+    filteredPotVoltage = alpha * rawV + (1 - alpha) * filteredPotVoltage;
+    float normalized = constrain(filteredPotVoltage / 5.0, 0.0, 1.0);
+    // ⚙️ Dead zone: debajo de 0.05 (~250 mV) => 0 corriente
+    if (normalized < 0.05) normalized = 0.0;
+
+    // ⚙️ Escalado exponencial para mayor precisión en bajas potencias
+    float shaped = pow(normalized, 1.8);  // curva suave (puedes ajustar 1.5–2.5)
+
+    // ⚙️ Calcular delay real (menor voltaje = más retardo)
+    scrDelayUs = (1.0 - shaped) * (SEMI_PERIOD_US );
+
     if (millis() - lastLog > 500) {
         lastLog = millis();
-        if (fabs(pot - lastPot) >= 0.5) {
-            Serial.printf("📊 Pot: %.2f%% | Vpot: %.3f V\n", pot, v);
-            lastPot = pot;
-        }
+        Serial.printf("📊 Pot bruto: %.3fV → filtrado: %.3fV → delay: %.1f µs\n",
+                  rawV, filteredPotVoltage, (float)scrDelayUs);
 
         for (int i = 0; i < NUM_DEVICES; i++) {
             if (verboseLog) Serial.printf("   Corriente[%d]: %.3f A\n", i, sensores.getCurrent(i));
