@@ -230,10 +230,6 @@ void handleInputChange(uint8_t inputNumber, bool state) {
                 startRequested = true;
                 startRequestTime = millis();
                 
-                ioController.setRelay(1, direction);
-                Serial.printf("⚡ Dirección fijada: %s (Relé 2 %s)\n",
-                      direction ? "DIRECTA" : "INVERSA",
-                      direction ? "ON" : "OFF");
             } else {
                 Serial.println("🛑 START liberado, apagando sistema");
                 startRequested = false;
@@ -246,13 +242,13 @@ void handleInputChange(uint8_t inputNumber, bool state) {
         
         case 1: // Botón DIRECCIÓN
             if (state) {
-                direction = true;  // Presionado = DIRECTA
-                ioController.setRelay(1, true);   // encender relé 2
-                Serial.println("🔄 Dirección: DIRECTA (Relé 2 ON)");
-            } else {
-                direction = false; // Suelto = INVERSA
-                ioController.setRelay(1, false);  // apagar relé 2
+                direction = false;  // Presionado = INVERSA
+                ioController.setRelay(1, false);   // Relé 2 OFF
                 Serial.println("🔄 Dirección: INVERSA (Relé 2 OFF)");
+            } else {
+                direction = true;  // Suelto = DIRECTA
+                ioController.setRelay(1, true);    // Relé 2 ON
+                Serial.println("🔄 Dirección: DIRECTA (Relé 2 ON)");
             }
             break;
 
