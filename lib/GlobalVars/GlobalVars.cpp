@@ -26,3 +26,6 @@ volatile int activeSCRsCount = 3; // Contador de SCRs activos
 volatile bool interruptsEnabled = true;
 volatile bool pwmGenerationEnabled = true;
 bool ioControlEnabled = false;
+
+float filteredPotVoltage = 0.0;
+uint32_t scrDelayUs = SEMI_PERIOD_US;

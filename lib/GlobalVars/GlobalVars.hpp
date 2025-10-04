@@ -68,6 +68,8 @@ extern volatile bool pwmGenerationEnabled;
 extern bool ioControlEnabled;
 
 extern bool verboseLog;  // false = solo mensajes importantes
+extern float filteredPotVoltage;
+extern uint32_t scrDelayUs;
 
 
 #endif
