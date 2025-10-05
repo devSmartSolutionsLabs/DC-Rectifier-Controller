@@ -301,12 +301,12 @@ void controlTaskFaseA(void* param) {
         if (xQueueReceive(zcQueues[0], &dev, portMAX_DELAY) == pdTRUE) {
             if (!systemStarted) { forceTurnOffSCR(0); continue; }
             
-            if (scrDelayUs >= 8300) {  
+            if (scrDelayUs >= 8320) {  
                 gpio_set_level((gpio_num_t)scrPins[0], 0);
                 scrActive[0] = false;
                 continue;
             }
-            else if (scrDelayUs <= 10) {
+            else if (scrDelayUs <= 1) {
                 gpio_set_level((gpio_num_t)scrPins[0], 1);
                 scrActive[0] = true;
                 pulseStartTime[0] = micros();
@@ -327,13 +327,13 @@ void controlTaskFaseB(void* param) {
         if (xQueueReceive(zcQueues[1], &dev, portMAX_DELAY) == pdTRUE) {
             if (!systemStarted) { forceTurnOffSCR(1); continue; }
             
-            if (scrDelayUs >= 8300) {  
+            if (scrDelayUs >= 8320) {  
                 gpio_set_level((gpio_num_t)scrPins[1], 0);
                 scrActive[1] = false;
                 continue;
             }
 
-            if (scrDelayUs <= 10) {
+            if (scrDelayUs <= 1) {
                 gpio_set_level((gpio_num_t)scrPins[1], 1);
                 scrActive[1] = true;
                 pulseStartTime[1] = micros();
@@ -354,13 +354,13 @@ void controlTaskFaseC(void* param) {
         if (xQueueReceive(zcQueues[2], &dev, portMAX_DELAY) == pdTRUE) {
             if (!systemStarted) { forceTurnOffSCR(2); continue; }
             
-            if (scrDelayUs >= 8300) {  
+            if (scrDelayUs >= 8320) {  
                 gpio_set_level((gpio_num_t)scrPins[2], 0);
                 scrActive[2] = false;
                 continue;
             }
 
-            if (scrDelayUs <= 10) {
+            if (scrDelayUs <= 1) {
                 gpio_set_level((gpio_num_t)scrPins[2], 1);
                 scrActive[2] = true;
                 pulseStartTime[2] = micros();
@@ -471,23 +471,31 @@ void loop() {
     static float lastscrDelayUs = -1;        // último valor registrado
     static uint32_t lastLog = 0;
     
-    float v = sensores.getVoltage();
-    float pot = sensores.getPotPercentage();
-    
-    float rawV = sensores.getVoltage();   // valor leido por ADS1115
-    rawV = constrain(rawV, 0.0, 5.0);
+    // ================== POTENCIÓMETRO Y CONTROL SCR ==================
+    const float POT_MAX_V = 5.0;
+    const uint32_t MIN_DELAY_US = 4000; // límite inferior (conducción máxima)
+    const uint32_t MAX_DELAY_US = SEMI_PERIOD_US; // límite superior (apagado)
+    const float alpha = 0.15; // Filtro EMA
+
+    // Lectura del potenciómetro
+    float rawV = sensores.getVoltage();   // valor leido por ADS1115 (0.0–5.0)
+    rawV = constrain(rawV, 0.0, POT_MAX_V);
 
     // Filtro exponencial suavizado
     filteredPotVoltage = alpha * rawV + (1 - alpha) * filteredPotVoltage;
-    float normalized = constrain(filteredPotVoltage / 5.0, 0.0, 1.0);
-    // ⚙️ Dead zone: debajo de 0.05 (~250 mV) => 0 corriente
-    if (normalized < 0.05) normalized = 0.0;
 
-    // ⚙️ Escalado exponencial para mayor precisión en bajas potencias
-    float shaped = pow(normalized, 1.8);  // curva suave (puedes ajustar 1.5–2.5)
+    // Usamos el valor filtrado
+    float vFiltered = filteredPotVoltage;
+    float norm = vFiltered / POT_MAX_V; // 0..1
 
-    // ⚙️ Calcular delay real (menor voltaje = más retardo)
-    scrDelayUs = (1.0 - shaped) * (SEMI_PERIOD_US );
+    // Mapeo lineal: 0V → 8333 µs, 5V → 4000 µs
+    scrDelayUs = MAX_DELAY_US - (uint32_t)(norm * (MAX_DELAY_US - MIN_DELAY_US));
+
+    // Límites y zona muerta
+    if (scrDelayUs > MAX_DELAY_US) scrDelayUs = MAX_DELAY_US;
+    if (scrDelayUs < MIN_DELAY_US) scrDelayUs = MIN_DELAY_US;
+    if (vFiltered < 0.1) scrDelayUs = MAX_DELAY_US; // <100 mV → sin conducción
+
 
     if (millis() - lastLog > 500) {
         lastLog = millis();
