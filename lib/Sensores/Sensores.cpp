@@ -39,7 +39,7 @@ bool Sensores::begin() {
         success = false;
     } else {
         adsHigh.setGain(GAIN_ONE);  // ±4.096V
-        adsHigh.setDataRate(RATE_ADS1115_860SPS); // ⚡ MÁXIMA VELOCIDAD
+        adsHigh.setDataRate(RATE_ADS1115_128SPS); // ⚡ MÁXIMA VELOCIDAD
         Serial.println("✅ ADS1115 (0x49) inicializado");
     }
     
@@ -121,25 +121,45 @@ bool Sensores::readAllSensors(float* results, uint8_t numChannels) {
 
     if (lowOK || highOK) {
         for (int dev = 0; dev < NUM_DEVICES; dev++) {
-            int16_t currentRaw = 0;
+            int16_t raw = 0;
             bool devOK = false;
-            
-            if (dev < 2 && lowOK) {
-                currentRaw = adsLow.readADC_SingleEnded(CURRENT_CHANNELS[dev]);
+
+            if (dev < 2 && lowOK) {                          // los dos primeros single-ended en 0x48
+                raw = adsLow.readADC_SingleEnded(CURRENT_CHANNELS[dev]);
                 devOK = true;
-            } else if (dev >= 2 && highOK) {
-                currentRaw = adsHigh.readADC_SingleEnded(CURRENT_CHANNELS[dev] - 4);
-                devOK = true;
-            }
+            } 
             
-            if (devOK) {
-                float currentVoltage = (currentRaw * 0.1875) / 1000.0;
-                current[dev] = (currentVoltage - offsetCurrentLow[dev]) * gainCurrentLow[dev];
-            } else {
-                current[dev] = 0.0;
+            else if (dev == 2 && highOK) {  // Corriente real en diferencial 0–1 de 0x49
+                // Leer una única conversión diferencial estable
+                int16_t raw = adsHigh.readADC_Differential_0_1();
+
+                // LSB para GAIN_ONE (±4.096 V) = 125 µV/bit
+                const float LSB_V = 7.8125e-6f;
+                float vSense = raw * LSB_V;  // en voltios
+
+                // Calibración empírica: 215 mV = 3300 A → 1 V = 15348 A
+                float ampsInstant = vSense * 200.0f;
+
+                // Filtro EMA (suavizado)
+                static float currentEMA = 0.0f;
+                const float alpha = 0.12f;  // 0.1 = más suave, 0.3 = más rápido
+                currentEMA = (1 - alpha) * currentEMA + alpha * ampsInstant;
+
+                // Zona muerta y límites
+                if (fabs(currentEMA) < 10.0f) currentEMA = 0.0f;
+                currentEMA = constrain(currentEMA, 0.0f, 6000.0f);
+
+                current[dev] = currentEMA;
+
+                Serial.printf("[ADS49] raw=%d | %.6f mV | %.1f A\n",
+                                raw, vSense*1000, current[dev]);
+                
+
+                devOK = true;
             }
         }
-    } else {
+    }            
+        else {
         success = false;
     }
 
