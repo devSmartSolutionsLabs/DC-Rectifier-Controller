@@ -154,7 +154,7 @@ uint8_t MCP23017_IO::readRegister(uint8_t reg) {
 uint8_t MCP23017_IO::readRegisterSafe(uint8_t reg) {
     uint8_t result = 0xFF;
     
-    if (!takeI2CMutex(15,"MCP_Read")) { // ⚡ Reducido a 15ms
+    if (!takeI2CMutex(100,"MCP_Read")) { // ⚡ Reducido a 15ms
         static uint32_t lastLog = 0;
         if (millis() - lastLog > 2000) { // Log cada 2 segundos máximo
             Serial.printf("❌ Timeout mutex en readRegisterSafe 0x%02X\n", reg);
