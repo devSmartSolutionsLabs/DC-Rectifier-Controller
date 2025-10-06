@@ -71,6 +71,10 @@ void IRAM_ATTR forceTurnOffSCR(uint8_t dev) {
 
 void updateSCREnabledStates(int percentage) {
     static int lastPercentage = -1;
+    
+    newEnabledStates[0] = true;
+    newEnabledStates[1] = true;
+    newEnabledStates[2] = true;
     if (percentage == lastPercentage) return;
     lastPercentage = percentage;
 
@@ -79,14 +83,14 @@ void updateSCREnabledStates(int percentage) {
 
     if (percentage <= SCR_1_PHASE_THRESHOLD) {
         newEnabledStates[0] = true;
-        newEnabledStates[1] = false;
-        newEnabledStates[2] = false;
+        newEnabledStates[1] = true;
+        newEnabledStates[2] = true;
         newActiveCount = 1;
         if (percentage > 0) Serial.printf("[SCR] Modo 1-FASE (A) - %d%%\n", percentage);
     } else if (percentage <= SCR_2_PHASE_THRESHOLD) {
         newEnabledStates[0] = true;
         newEnabledStates[1] = true;
-        newEnabledStates[2] = false;
+        newEnabledStates[2] = true;
         newActiveCount = 2;
         Serial.printf("[SCR] Modo 2-FASES (A+B) - %d%%\n", percentage);
     } else {
@@ -97,9 +101,6 @@ void updateSCREnabledStates(int percentage) {
         Serial.printf("[SCR] Modo 3-FASES (A+B+C) - %d%%\n", percentage);
     }
 
-    newEnabledStates[0] = true;
-    newEnabledStates[1] = true;
-    newEnabledStates[2] = true;
         
     for (int i = 0; i < NUM_DEVICES; i++) {
         scrEnabled[i] = newEnabledStates[i];
@@ -301,7 +302,7 @@ void controlTaskFaseA(void* param) {
         if (xQueueReceive(zcQueues[0], &dev, portMAX_DELAY) == pdTRUE) {
             if (!systemStarted) { forceTurnOffSCR(0); continue; }
             
-            if (scrDelayUs >= 8320) {  
+            if (scrDelayUs >= 8300) {  
                 gpio_set_level((gpio_num_t)scrPins[0], 0);
                 scrActive[0] = false;
                 continue;
@@ -312,6 +313,8 @@ void controlTaskFaseA(void* param) {
                 pulseStartTime[0] = micros();
                 pulseCount[0]++;
             } else if (scrDelayUs < SEMI_PERIOD_US) {
+                Serial.printf("[FaseA] Disparo programado en %lu µs\n", scrDelayUs);
+                esp_timer_stop(fireTimers[0]);
                 esp_timer_start_once(fireTimers[0], scrDelayUs);
             }
         }
@@ -327,7 +330,7 @@ void controlTaskFaseB(void* param) {
         if (xQueueReceive(zcQueues[1], &dev, portMAX_DELAY) == pdTRUE) {
             if (!systemStarted) { forceTurnOffSCR(1); continue; }
             
-            if (scrDelayUs >= 8320) {  
+            if (scrDelayUs >= 8300) {  
                 gpio_set_level((gpio_num_t)scrPins[1], 0);
                 scrActive[1] = false;
                 continue;
@@ -339,6 +342,8 @@ void controlTaskFaseB(void* param) {
                 pulseStartTime[1] = micros();
                 pulseCount[1]++;
             } else if (scrDelayUs < SEMI_PERIOD_US) {
+                Serial.printf("[FaseB] Disparo programado en %lu µs\n", scrDelayUs);
+                esp_timer_stop(fireTimers[1]);
                 esp_timer_start_once(fireTimers[1], scrDelayUs);
             }
         }
@@ -354,7 +359,7 @@ void controlTaskFaseC(void* param) {
         if (xQueueReceive(zcQueues[2], &dev, portMAX_DELAY) == pdTRUE) {
             if (!systemStarted) { forceTurnOffSCR(2); continue; }
             
-            if (scrDelayUs >= 8320) {  
+            if (scrDelayUs >= 8300) {  
                 gpio_set_level((gpio_num_t)scrPins[2], 0);
                 scrActive[2] = false;
                 continue;
@@ -366,6 +371,8 @@ void controlTaskFaseC(void* param) {
                 pulseStartTime[2] = micros();
                 pulseCount[2]++;
             } else if (scrDelayUs < SEMI_PERIOD_US) {
+                Serial.printf("[FaseC] Disparo programado en %lu µs\n", scrDelayUs);
+                esp_timer_stop(fireTimers[2]);
                 esp_timer_start_once(fireTimers[2], scrDelayUs);
             }
         }
