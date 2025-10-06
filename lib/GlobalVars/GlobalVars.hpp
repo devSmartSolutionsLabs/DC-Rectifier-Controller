@@ -9,7 +9,7 @@
 // ================== CONSTANTES DE COMPILACIÓN ==================
 #define NUM_DEVICES 3
 #define SEMI_PERIOD_US 8333
-#define DEBOUNCE_TIME_US 200
+#define DEBOUNCE_TIME_US 20
 #define START_DELAY_MS 3000
 
 // Umbrales para activación progresiva de SCRs

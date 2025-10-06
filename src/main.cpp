@@ -120,15 +120,10 @@ void IRAM_ATTR zcISR_FaseA(void* arg) {
         zcCount[0]++;
         gpio_set_level((gpio_num_t)scrPins[0], 0);
         scrActive[0] = false;
-        uint32_t currentPot = potPercentage;
-        if (currentPot >= 95) {
-            gpio_set_level((gpio_num_t)scrPins[0], 1);
-            scrActive[0] = true;
-            pulseStartTime[0] = micros();
-            pulseCount[0]++;
-        } else {
-            uint8_t dev = 0;
+        // Si hay un retardo válido, agenda el disparo
+        if (scrDelayUs < SEMI_PERIOD_US && scrDelayUs > 0) {
             BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+            uint8_t dev = 0;
             xQueueSendFromISR(zcQueues[0], &dev, &xHigherPriorityTaskWoken);
             if (xHigherPriorityTaskWoken) portYIELD_FROM_ISR();
         }
@@ -142,15 +137,10 @@ void IRAM_ATTR zcISR_FaseB(void* arg) {
         zcCount[1]++;
         gpio_set_level((gpio_num_t)scrPins[1], 0);
         scrActive[1] = false;
-        uint32_t currentPot = potPercentage;
-        if (currentPot >= 95) {
-            gpio_set_level((gpio_num_t)scrPins[1], 1);
-            scrActive[1] = true;
-            pulseStartTime[1] = micros();
-            pulseCount[1]++;
-        } else {
-            uint8_t dev = 1;
+        // Si hay un retardo válido, agenda el disparo
+        if (scrDelayUs < SEMI_PERIOD_US && scrDelayUs > 0) {
             BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+            uint8_t dev = 1;
             xQueueSendFromISR(zcQueues[1], &dev, &xHigherPriorityTaskWoken);
             if (xHigherPriorityTaskWoken) portYIELD_FROM_ISR();
         }
@@ -164,15 +154,10 @@ void IRAM_ATTR zcISR_FaseC(void* arg) {
         zcCount[2]++;
         gpio_set_level((gpio_num_t)scrPins[2], 0);
         scrActive[2] = false;
-        uint32_t currentPot = potPercentage;
-        if (currentPot >= 95) {
-            gpio_set_level((gpio_num_t)scrPins[2], 1);
-            scrActive[2] = true;
-            pulseStartTime[2] = micros();
-            pulseCount[2]++;
-        } else {
-            uint8_t dev = 2;
+        // Si hay un retardo válido, agenda el disparo
+        if (scrDelayUs < SEMI_PERIOD_US && scrDelayUs > 0) {
             BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+            uint8_t dev = 2;
             xQueueSendFromISR(zcQueues[2], &dev, &xHigherPriorityTaskWoken);
             if (xHigherPriorityTaskWoken) portYIELD_FROM_ISR();
         }
