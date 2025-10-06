@@ -71,6 +71,7 @@ void IRAM_ATTR forceTurnOffSCR(uint8_t dev) {
 
 void updateSCREnabledStates(int percentage) {
     static int lastPercentage = -1;
+    bool newEnabledStates[NUM_DEVICES];
     
     newEnabledStates[0] = true;
     newEnabledStates[1] = true;
@@ -78,7 +79,6 @@ void updateSCREnabledStates(int percentage) {
     if (percentage == lastPercentage) return;
     lastPercentage = percentage;
 
-    bool newEnabledStates[NUM_DEVICES];
     int newActiveCount = 0;
 
     if (percentage <= SCR_1_PHASE_THRESHOLD) {
