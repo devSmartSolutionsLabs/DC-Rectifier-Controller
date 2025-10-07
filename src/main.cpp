@@ -453,7 +453,7 @@ void setup() {
     xTaskCreate(adsReadTask, "ADS Read Task", 4096, NULL, 3, NULL);
 
     // Configurar Watchdog
-    esp_task_wdt_init(30, false);
+    //esp_task_wdt_init(30, false);
 
     Serial.println("=== SETUP COMPLETADO ===");
 }
