@@ -26,6 +26,9 @@ volatile uint32_t pulseDuration[NUM_DEVICES] = {0};
 volatile uint32_t pulseCount[NUM_DEVICES] = {0};
 volatile uint32_t zcCount[NUM_DEVICES] = {0};
 
+// Para capturar delay en momento del zero crossing
+volatile uint32_t currentPhaseDelays[NUM_DEVICES] = {8300, 8300, 8300};
+
 // Botón START
 int startButtonPin = -1;
 bool startButtonDetected = false;
@@ -83,14 +86,14 @@ void updateSCREnabledStates(int percentage) {
 
     if (percentage <= SCR_1_PHASE_THRESHOLD) {
         newEnabledStates[0] = true;
-        newEnabledStates[1] = true;
-        newEnabledStates[2] = true;
+        newEnabledStates[1] = false;
+        newEnabledStates[2] = false;
         newActiveCount = 1;
         if (percentage > 0) Serial.printf("[SCR] Modo 1-FASE (A) - %d%%\n", percentage);
     } else if (percentage <= SCR_2_PHASE_THRESHOLD) {
         newEnabledStates[0] = true;
         newEnabledStates[1] = true;
-        newEnabledStates[2] = true;
+        newEnabledStates[2] = false;
         newActiveCount = 2;
         Serial.printf("[SCR] Modo 2-FASES (A+B) - %d%%\n", percentage);
     } else {
@@ -101,7 +104,6 @@ void updateSCREnabledStates(int percentage) {
         Serial.printf("[SCR] Modo 3-FASES (A+B+C) - %d%%\n", percentage);
     }
 
-        
     for (int i = 0; i < NUM_DEVICES; i++) {
         scrEnabled[i] = newEnabledStates[i];
         if (!scrEnabled[i] && scrActive[i]) {
@@ -111,67 +113,117 @@ void updateSCREnabledStates(int percentage) {
     activeSCRsCount = newActiveCount;
 }
 
-// ISR zero crossing (fase A/B/C)
+// Estructura para pasar datos de ISR a task
+typedef struct {
+    uint8_t dev;
+    uint32_t delay_us;
+} ZCEvent_t;
+
+// ISR zero crossing CORREGIDAS
 void IRAM_ATTR zcISR_FaseA(void* arg) {
     if (!systemStarted || !scrEnabled[0]) return;
     uint32_t now = micros();
-    if (now - lastZCTime[0] > DEBOUNCE_TIME_US) {
-        lastZCTime[0] = now;
-        zcCount[0]++;
-        gpio_set_level((gpio_num_t)scrPins[0], 0);
-        scrActive[0] = false;
-        // Si hay un retardo válido, agenda el disparo
-        if (scrDelayUs < SEMI_PERIOD_US && scrDelayUs > 0) {
-            BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-            uint8_t dev = 0;
-            xQueueSendFromISR(zcQueues[0], &dev, &xHigherPriorityTaskWoken);
-            if (xHigherPriorityTaskWoken) portYIELD_FROM_ISR();
-        }
+    zcCount[0]++;
+
+    // Apagar SCR inmediatamente
+    gpio_set_level((gpio_num_t)scrPins[0], 0);
+    scrActive[0] = false;
+        
+    // Capturar delay actual para esta fase
+    uint32_t currentDelay = scrDelayUs;
+        
+    if (currentDelay >= 8300) {
+            // No disparar - mantener apagado
+        return;
+    }
+    else if (currentDelay <= 100) {
+        // Disparo inmediato (conducción completa)
+        gpio_set_level((gpio_num_t)scrPins[0], 1);
+        scrActive[0] = true;
+        pulseStartTime[0] = micros();
+        pulseCount[0]++;
+    } else { 
+        // Programar disparo con el MISMO delay
+        BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+        uint8_t dev = 0;
+        xQueueSendFromISR(zcQueues[0], &dev, &xHigherPriorityTaskWoken);
+        if (xHigherPriorityTaskWoken) portYIELD_FROM_ISR();
     }
 }
+
 void IRAM_ATTR zcISR_FaseB(void* arg) {
     if (!systemStarted || !scrEnabled[1]) return;
     uint32_t now = micros();
-    if (now - lastZCTime[1] > DEBOUNCE_TIME_US) {
-        lastZCTime[1] = now;
         zcCount[1]++;
+        
+        // Apagar SCR inmediatamente
         gpio_set_level((gpio_num_t)scrPins[1], 0);
         scrActive[1] = false;
-        // Si hay un retardo válido, agenda el disparo
-        if (scrDelayUs < SEMI_PERIOD_US && scrDelayUs > 0) {
+        
+        // Capturar delay actual para esta fase
+        uint32_t currentDelay = scrDelayUs;
+
+        if (currentDelay >= 8300) {
+            // No disparar - mantener apagado
+            return;
+        }
+        else if (currentDelay <= 100) {
+            // Disparo inmediato (conducción completa)
+            gpio_set_level((gpio_num_t)scrPins[1], 1);
+            scrActive[1] = true;
+            pulseStartTime[1] = micros();
+            pulseCount[1]++;
+        } else {
+            // Programar disparo con el MISMO delay
             BaseType_t xHigherPriorityTaskWoken = pdFALSE;
             uint8_t dev = 1;
             xQueueSendFromISR(zcQueues[1], &dev, &xHigherPriorityTaskWoken);
             if (xHigherPriorityTaskWoken) portYIELD_FROM_ISR();
         }
-    }
 }
+
 void IRAM_ATTR zcISR_FaseC(void* arg) {
     if (!systemStarted || !scrEnabled[2]) return;
     uint32_t now = micros();
-    if (now - lastZCTime[2] > DEBOUNCE_TIME_US) {
-        lastZCTime[2] = now;
         zcCount[2]++;
+        
+        // Apagar SCR inmediatamente
         gpio_set_level((gpio_num_t)scrPins[2], 0);
         scrActive[2] = false;
-        // Si hay un retardo válido, agenda el disparo
-        if (scrDelayUs < SEMI_PERIOD_US && scrDelayUs > 0) {
+        
+        // Capturar delay actual para esta fase
+        uint32_t currentDelay = scrDelayUs;
+
+        if (currentDelay >= 8300) {
+            // No disparar - mantener apagado
+            return;
+        }
+        else if (currentDelay <= 100) {
+            // Disparo inmediato (conducción completa)
+            gpio_set_level((gpio_num_t)scrPins[2], 1);
+            scrActive[2] = true;
+            pulseStartTime[2] = micros();
+            pulseCount[2]++;
+        } else {
+            // Programar disparo con el MISMO delay
             BaseType_t xHigherPriorityTaskWoken = pdFALSE;
             uint8_t dev = 2;
             xQueueSendFromISR(zcQueues[2], &dev, &xHigherPriorityTaskWoken);
             if (xHigherPriorityTaskWoken) portYIELD_FROM_ISR();
         }
-    }
 }
 
 // Timer callback
 void IRAM_ATTR timerCallback(void* arg) {
     if (!systemStarted) return;
     uint8_t dev = (uint8_t)(intptr_t)arg;
-    gpio_set_level((gpio_num_t)scrPins[dev], 1);
-    scrActive[dev] = true;
-    pulseStartTime[dev] = micros();
-    pulseCount[dev]++;
+    
+    if (scrEnabled[dev]) {
+        gpio_set_level((gpio_num_t)scrPins[dev], 1);
+        scrActive[dev] = true;
+        pulseStartTime[dev] = micros();
+        pulseCount[dev]++;
+    }
 }
 
 // ========== I2C MANAGER ==========
@@ -223,6 +275,10 @@ void handleInputChange(uint8_t inputNumber, bool state) {
                 Serial.println("🛑 START liberado, apagando sistema");
                 startRequested = false;
                 systemStarted = false;
+                // Apagar todos los SCRs
+                for (int i = 0; i < NUM_DEVICES; i++) {
+                    forceTurnOffSCR(i);
+                }
                 ioController.setRelay(0, false);
             }
             break;
@@ -276,89 +332,71 @@ void digitalInputTask(void* parameter) {
     }
 }
 
-// ================== CONTROL TASKS ==================
+// ================== CONTROL TASKS CORREGIDAS ==================
 void controlTaskFaseA(void* param) {
     uint8_t dev;
-    float potVoltage;
-    static float filteredVoltage = 0.0;  // Valor suavizado persistente
-    const float alpha = 0.15;            // ⚙️ Suavizado (0.1–0.3 recomendado)
-    uint32_t delay_us;
     while (true) {
         if (xQueueReceive(zcQueues[0], &dev, portMAX_DELAY) == pdTRUE) {
-            if (!systemStarted) { forceTurnOffSCR(0); continue; }
+            if (!systemStarted) { 
+                forceTurnOffSCR(dev); 
+                continue; 
+            }
             
-            if (scrDelayUs >= 8300) {  
-                gpio_set_level((gpio_num_t)scrPins[0], 0);
-                scrActive[0] = false;
+            // Usar EXACTAMENTE el mismo scrDelayUs
+            uint32_t currentDelay = scrDelayUs;
+            
+            if (currentDelay >= 8300) {  
                 continue;
             }
-            else if (scrDelayUs <= 1) {
-                gpio_set_level((gpio_num_t)scrPins[0], 1);
-                scrActive[0] = true;
-                pulseStartTime[0] = micros();
-                pulseCount[0]++;
-            } else if (scrDelayUs < SEMI_PERIOD_US) {
-                Serial.printf("[FaseA] Disparo programado en %lu µs\n", scrDelayUs);
-                esp_timer_stop(fireTimers[0]);
-                esp_timer_start_once(fireTimers[0], scrDelayUs);
+            else if (currentDelay < SEMI_PERIOD_US && currentDelay > 100) {
+                esp_timer_stop(fireTimers[dev]);
+                esp_timer_start_once(fireTimers[dev], currentDelay);
             }
         }
     }
 }
+
 void controlTaskFaseB(void* param) {
     uint8_t dev;
-    float potVoltage;
-    static float filteredVoltage = 0.0;  // Valor suavizado persistente
-    const float alpha = 0.15;            // ⚙️ Suavizado (0.1–0.3 recomendado)
-    uint32_t delay_us;
     while (true) {
         if (xQueueReceive(zcQueues[1], &dev, portMAX_DELAY) == pdTRUE) {
-            if (!systemStarted) { forceTurnOffSCR(1); continue; }
+            if (!systemStarted) { 
+                forceTurnOffSCR(dev); 
+                continue; 
+            }
             
-            if (scrDelayUs >= 8300) {  
-                gpio_set_level((gpio_num_t)scrPins[1], 0);
-                scrActive[1] = false;
+            // Usar EXACTAMENTE el mismo scrDelayUs
+            uint32_t currentDelay = scrDelayUs;
+            
+            if (currentDelay >= 8300) {  
                 continue;
             }
-
-            if (scrDelayUs <= 1) {
-                gpio_set_level((gpio_num_t)scrPins[1], 1);
-                scrActive[1] = true;
-                pulseStartTime[1] = micros();
-                pulseCount[1]++;
-            } else if (scrDelayUs < SEMI_PERIOD_US) {
-                Serial.printf("[FaseB] Disparo programado en %lu µs\n", scrDelayUs);
-                esp_timer_stop(fireTimers[1]);
-                esp_timer_start_once(fireTimers[1], scrDelayUs);
+            else if (currentDelay < SEMI_PERIOD_US && currentDelay > 100) {
+                esp_timer_stop(fireTimers[dev]);
+                esp_timer_start_once(fireTimers[dev], currentDelay);
             }
         }
     }
 }
+
 void controlTaskFaseC(void* param) {
     uint8_t dev;
-    float potVoltage;
-    static float filteredVoltage = 0.0;  // Valor suavizado persistente
-    const float alpha = 0.15;            // ⚙️ Suavizado (0.1–0.3 recomendado)
-    uint32_t delay_us;
     while (true) {
         if (xQueueReceive(zcQueues[2], &dev, portMAX_DELAY) == pdTRUE) {
-            if (!systemStarted) { forceTurnOffSCR(2); continue; }
+            if (!systemStarted) { 
+                forceTurnOffSCR(dev); 
+                continue; 
+            }
             
-            if (scrDelayUs >= 8300) {  
-                gpio_set_level((gpio_num_t)scrPins[2], 0);
-                scrActive[2] = false;
+            // Usar EXACTAMENTE el mismo scrDelayUs
+            uint32_t currentDelay = scrDelayUs;
+            
+            if (currentDelay >= 8300) {  
                 continue;
             }
-
-            if (scrDelayUs <= 1) {
-                gpio_set_level((gpio_num_t)scrPins[2], 1);
-                scrActive[2] = true;
-                pulseStartTime[2] = micros();
-                pulseCount[2]++;
-            } else if (scrDelayUs < SEMI_PERIOD_US) {
-                Serial.printf("[FaseC] Disparo programado en %lu µs\n", scrDelayUs);
-                esp_timer_stop(fireTimers[2]);
-                esp_timer_start_once(fireTimers[2], scrDelayUs);
+            else if (currentDelay < SEMI_PERIOD_US && currentDelay > 100) {
+                esp_timer_stop(fireTimers[dev]);
+                esp_timer_start_once(fireTimers[dev], currentDelay);
             }
         }
     }
@@ -379,7 +417,7 @@ void adsReadTask(void* parameter) {
     }
 }
 
-// ================== SETUP ==================
+// ================== SETUP CORREGIDO ==================
 void setup() {
     Serial.begin(115200);
     delay(1000);
@@ -401,7 +439,8 @@ void setup() {
         pinMode(zcPins[i], INPUT_PULLDOWN);
         pinMode(scrPins[i], OUTPUT);
         digitalWrite(scrPins[i], LOW);
-        zcQueues[i] = xQueueCreate(10, sizeof(uint8_t));
+        zcQueues[i] = xQueueCreate(10, sizeof(ZCEvent_t)); // Cambiado a ZCEvent_t
+        currentPhaseDelays[i] = 8300; // Inicializar con apagado
     }
 
     sensores.begin();
@@ -410,7 +449,6 @@ void setup() {
     ioController.setRelay(1, true);    // Encender relé 2 (dirección directa)
 
     Serial.println("⚙️ Estado inicial: Dirección DIRECTA (Relé 2 ON)");
-
 
     gpio_install_isr_service(ESP_INTR_FLAG_LEVEL3);
     gpio_set_intr_type((gpio_num_t)zcPins[0], GPIO_INTR_POSEDGE);
@@ -443,9 +481,7 @@ void setup() {
     Serial.println("=== SETUP COMPLETADO ===");
 }
 
-// ================== LOOP ==================
-const float alpha = 0.15;  // Filtro EMA (más bajo = más suave)
-
+// ================== LOOP CORREGIDO ==================
 void loop() {
     processSerialCommands();
     updateSCREnabledStates(sensores.getPotPercentage());
@@ -460,7 +496,6 @@ void loop() {
         }
     }
 
-    static float lastscrDelayUs = -1;        // último valor registrado
     static uint32_t lastLog = 0;
     
     // ================== POTENCIÓMETRO Y CONTROL SCR ==================
@@ -488,22 +523,40 @@ void loop() {
     if (scrDelayUs < MIN_DELAY_US) scrDelayUs = MIN_DELAY_US;
     if (vFiltered < 0.1) scrDelayUs = MAX_DELAY_US; // <100 mV → sin conducción
 
+    // Actualizar delays para todas las fases activas
+    for (int i = 0; i < NUM_DEVICES; i++) {
+        if (scrEnabled[i]) {
+            currentPhaseDelays[i] = scrDelayUs;
+        } else {
+            currentPhaseDelays[i] = 8300; // Apagado para fases deshabilitadas
+        }
+    }
 
     if (millis() - lastLog > 500) {
         lastLog = millis();
-        Serial.printf("📊 Pot bruto: %.3fV → filtrado: %.3fV → delay: %.1f µs\n",
-                  rawV, filteredPotVoltage, (float)scrDelayUs);
+        Serial.printf("📊 Pot bruto: %.3fV → filtrado: %.3fV → delay: %lu µs\n",
+                  rawV, filteredPotVoltage, scrDelayUs);
+
+        // Debug de estados de fase
+        Serial.printf("🔧 Fases: A[%s] B[%s] C[%s] | Delays: A=%lu B=%lu C=%lu\n",
+            scrEnabled[0] ? "ON" : "OFF", 
+            scrEnabled[1] ? "ON" : "OFF", 
+            scrEnabled[2] ? "ON" : "OFF",
+            currentPhaseDelays[0], currentPhaseDelays[1], currentPhaseDelays[2]);
 
         for (int i = 0; i < NUM_DEVICES; i++) {
             if (verboseLog) Serial.printf("   Corriente[%d]: %.3f A\n", i, sensores.getCurrent(i));
         }
+        
         uint8_t inputs = ioController.readAllInputs(); 
-        if (verboseLog) Serial.print("🔘 Botones: ");
-        for (int i = 0; i < 8; i++) {
-            bool pressed = (inputs & (1 << i)) == 0;
-            if (verboseLog) Serial.printf("[%d:%s] ", i, pressed ? "ON" : "OFF");
+        if (verboseLog) {
+            Serial.print("🔘 Botones: ");
+            for (int i = 0; i < 8; i++) {
+                bool pressed = (inputs & (1 << i)) == 0;
+                Serial.printf("[%d:%s] ", i, pressed ? "ON" : "OFF");
+            }
+            Serial.println();
         }
-        if (verboseLog) Serial.println();
     }
 
     vTaskDelay(50 / portTICK_PERIOD_MS);
