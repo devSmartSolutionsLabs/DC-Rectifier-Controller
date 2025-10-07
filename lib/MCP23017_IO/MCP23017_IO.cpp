@@ -16,10 +16,45 @@ MCP23017_IO::MCP23017_IO(uint8_t address) :
     lastReadTime(0)
 {}
 
-// --- writeRegisterSafe (debe estar primero) ---
+
+// ⚡ LECTURA ULTRA RÁPIDA CON REINTENTOS
+uint8_t MCP23017_IO::readRegisterSafe(uint8_t reg) {
+    uint8_t result = 0xFF;
+    
+    // ⚡ PRIMER INTENTO - Timeout muy corto
+    if (!takeI2CMutex(8, "MCP_FAST")) { // 8ms timeout
+        // ⚡ SEGUNDO INTENTO - Pequeña pausa y reintento
+        vTaskDelay(1 / portTICK_PERIOD_MS);
+        if (!takeI2CMutex(8, "MCP_RETRY")) {
+            return result; // Falló ambos intentos
+        }
+    }
+    
+    // ⚡ OPERACIÓN I2C ULTRA RÁPIDA
+    uint32_t startTime = micros();
+    Wire.beginTransmission(_addr);
+    Wire.write(reg);
+    if (Wire.endTransmission() == 0) {
+        Wire.requestFrom(_addr, (uint8_t)1, (uint8_t)true); // Stop después de leer
+        if (Wire.available()) {
+            result = Wire.read();
+        }
+    }
+    
+    giveI2CMutex();
+    
+    // Debug de performance (opcional)
+    uint32_t duration = micros() - startTime;
+    if (duration > 1000 && verboseLog) {
+        Serial.printf("[MCP_TIMING] Lectura tomó %luμs\n", duration);
+    }
+    
+    return result;
+}
+
+// ⚡ ESCRITURA RÁPIDA
 bool MCP23017_IO::writeRegisterSafe(uint8_t reg, uint8_t value) {
-    if (!takeI2CMutex(50,"MCP_Write")) { // ✅ Timeout más corto
-        if (verboseLog) Serial.printf("❌ Timeout mutex en writeRegisterSafe 0x%02X\n", reg);
+    if (!takeI2CMutex(10, "MCP_WRITE")) {
         return false;
     }
     
@@ -29,12 +64,13 @@ bool MCP23017_IO::writeRegisterSafe(uint8_t reg, uint8_t value) {
     Wire.write(value);
     uint8_t error = Wire.endTransmission();
     
-    giveI2CMutex(); // ✅ Liberar inmediatamente
+    giveI2CMutex();
     
     if (error == 0) {
         success = true;
-    } else {
-        Serial.printf("❌ Error I2C 0x%02X en write 0x%02X\n", error, reg);
+        if (reg == GPIOA) {
+            relayStates = value; // Actualizar estado en RAM
+        }
     }
     
     return success;
@@ -68,7 +104,7 @@ bool MCP23017_IO::begin(uint8_t sdaPin, uint8_t sclPin, uint8_t address) {
         intentos++;
         
         // USAR MUTEX SOLO para la detección
-        if (takeI2CMutex(500,"MCP_begin")) {
+        if (takeI2CMutex(200,"MCP_begin")) {
             Wire.beginTransmission(_addr);
             uint8_t error = Wire.endTransmission();
             giveI2CMutex(); // ✅ LIBERAR INMEDIATAMENTE
@@ -151,31 +187,6 @@ uint8_t MCP23017_IO::readRegister(uint8_t reg) {
     return val;
 }
 
-uint8_t MCP23017_IO::readRegisterSafe(uint8_t reg) {
-    uint8_t result = 0xFF;
-    
-    if (!takeI2CMutex(100,"MCP_Read")) { // ⚡ Reducido a 15ms
-        static uint32_t lastLog = 0;
-        if (millis() - lastLog > 2000) { // Log cada 2 segundos máximo
-            Serial.printf("❌ Timeout mutex en readRegisterSafe 0x%02X\n", reg);
-            lastLog = millis();
-        }
-        return result;
-    }
-    
-    // Operación I2C ultra rápida
-    Wire.beginTransmission(_addr);
-    Wire.write(reg);
-    if (Wire.endTransmission() == 0) {
-        Wire.requestFrom(_addr, (uint8_t)1);
-        if (Wire.available()) {
-            result = Wire.read();
-        }
-    }
-    
-    giveI2CMutex();
-    return result;
-}
 
 void MCP23017_IO::writeRegister(uint8_t reg, uint8_t value) {
     writeRegisterSafe(reg, value); // Reutilizar función segura
