@@ -94,6 +94,7 @@ typedef struct {
     uint32_t delay_us;
 } ZCEvent_t;
 
+// ================== ISR SIN BUSY-WAIT ==================
 void IRAM_ATTR zcISR_Generic(void* arg) {
     uint8_t dev = (uint8_t)(intptr_t)arg;
     
@@ -104,13 +105,13 @@ void IRAM_ATTR zcISR_Generic(void* arg) {
         lastZCTime[dev] = now;
         zcCount[dev]++;
         
-        // Apagar SCR
+        // Apagar SCR inmediatamente
         gpio_set_level((gpio_num_t)scrPins[dev], 0);
         scrActive[dev] = false;
         
-        // VERIFICACIÓN DE SEGURIDAD MEJORADA
+        // VERIFICACIÓN DE SEGURIDAD
         if (scrDelayUs >= ABSOLUTE_MAX_DELAY) {
-            return; // APAGADO COMPLETO - no disparar
+            return; // APAGADO COMPLETO
         }
         
         // Asegurar que el delay está en zona segura
@@ -131,21 +132,17 @@ void IRAM_ATTR zcISR_Generic(void* arg) {
         // Conducir solo en las primeras 2 semiondas del ciclo
         if (positionInCycle < 2 && safeDelay < SAFE_MAX_DELAY) {
             if (safeDelay <= 100) {
-                // Disparo inmediato
+                // Disparo inmediato (sin busy-wait)
                 gpio_set_level((gpio_num_t)scrPins[dev], 1);
                 scrActive[dev] = true;
                 pulseStartTime[dev] = micros();
                 pulseCount[dev]++;
             } else {
-                // Disparo con delay seguro
-                uint32_t targetTime = now + safeDelay;
-                while (micros() < targetTime) {
-                    asm volatile ("nop");
-                }
-                gpio_set_level((gpio_num_t)scrPins[dev], 1);
-                scrActive[dev] = true;
-                pulseStartTime[dev] = micros();
-                pulseCount[dev]++;
+                // Programar timer para disparo retardado (NO busy-wait en ISR)
+                BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+                uint8_t devToFire = dev;
+                xQueueSendFromISR(zcQueues[dev], &devToFire, &xHigherPriorityTaskWoken);
+                if (xHigherPriorityTaskWoken) portYIELD_FROM_ISR();
             }
         }
         
@@ -275,71 +272,42 @@ void digitalInputTask(void* parameter) {
     }
 }
 
-// ================== CONTROL TASKS CORREGIDAS ==================
-void controlTaskFaseA(void* param) {
+// ================== CONTROL TASK GENÉRICA ==================
+void controlTaskGeneric(void* param) {
+    uint8_t queueIndex = (uint8_t)(intptr_t)param; // 0, 1 o 2
     uint8_t dev;
+    
     while (true) {
-        if (xQueueReceive(zcQueues[0], &dev, portMAX_DELAY) == pdTRUE) {
+        if (xQueueReceive(zcQueues[queueIndex], &dev, portMAX_DELAY) == pdTRUE) {
             if (!systemStarted) { 
                 forceTurnOffSCR(dev); 
                 continue; 
             }
             
-            // Usar EXACTAMENTE el mismo scrDelayUs
             uint32_t currentDelay = scrDelayUs;
             
-            if (currentDelay >= 8300) {  
+            if (currentDelay >= SAFE_MAX_DELAY) {  
                 continue;
             }
-            else if (currentDelay < SEMI_PERIOD_US && currentDelay > 100) {
-                esp_timer_stop(fireTimers[dev]);
-                esp_timer_start_once(fireTimers[dev], currentDelay);
-            }
-        }
-    }
-}
-
-void controlTaskFaseB(void* param) {
-    uint8_t dev;
-    while (true) {
-        if (xQueueReceive(zcQueues[1], &dev, portMAX_DELAY) == pdTRUE) {
-            if (!systemStarted) { 
-                forceTurnOffSCR(dev); 
-                continue; 
-            }
-            
-            // Usar EXACTAMENTE el mismo scrDelayUs
-            uint32_t currentDelay = scrDelayUs;
-            
-            if (currentDelay >= 8300) {  
-                continue;
-            }
-            else if (currentDelay < SEMI_PERIOD_US && currentDelay > 100) {
-                esp_timer_stop(fireTimers[dev]);
-                esp_timer_start_once(fireTimers[dev], currentDelay);
-            }
-        }
-    }
-}
-
-void controlTaskFaseC(void* param) {
-    uint8_t dev;
-    while (true) {
-        if (xQueueReceive(zcQueues[2], &dev, portMAX_DELAY) == pdTRUE) {
-            if (!systemStarted) { 
-                forceTurnOffSCR(dev); 
-                continue; 
-            }
-            
-            // Usar EXACTAMENTE el mismo scrDelayUs
-            uint32_t currentDelay = scrDelayUs;
-            
-            if (currentDelay >= 8300) {  
-                continue;
-            }
-            else if (currentDelay < SEMI_PERIOD_US && currentDelay > 100) {
-                esp_timer_stop(fireTimers[dev]);
-                esp_timer_start_once(fireTimers[dev], currentDelay);
+            else if (currentDelay < SAFE_MAX_DELAY && currentDelay > 100) {
+                // HACER BUSY-WAIT EN LA TASK (no en ISR)
+                uint32_t targetTime = micros() + currentDelay;
+                while (micros() < targetTime) {
+                    asm volatile ("nop");
+                }
+                
+                // Verificar que todavía esté habilitado antes de disparar
+                if (scrEnabled[dev] && systemStarted) {
+                    gpio_set_level((gpio_num_t)scrPins[dev], 1);
+                    scrActive[dev] = true;
+                    pulseStartTime[dev] = micros();
+                    pulseCount[dev]++;
+                    
+                    if (verboseLog && pulseCount[dev] % 50 == 0) {
+                        Serial.printf("[Fase%c] Disparo retardado: %luµs\n", 
+                                     'A' + dev, currentDelay);
+                    }
+                }
             }
         }
     }
@@ -416,6 +384,7 @@ void updateWaveBasedControl() {
 }
 
 // ================== SETUP CORREGIDO ==================
+// ================== SETUP SIMPLIFICADO ==================
 void setup() {
     Serial.begin(115200);
     delay(1000);
@@ -437,29 +406,26 @@ void setup() {
         pinMode(zcPins[i], INPUT_PULLDOWN);
         pinMode(scrPins[i], OUTPUT);
         digitalWrite(scrPins[i], LOW);
-        zcQueues[i] = xQueueCreate(10, sizeof(ZCEvent_t)); // Cambiado a ZCEvent_t
-        currentPhaseDelays[i] = 8300; // Inicializar con apagado
+        zcQueues[i] = xQueueCreate(10, sizeof(uint8_t));
+        currentPhaseDelays[i] = 8300;
     }
 
     sensores.begin();
     ioController.begin(5,4);
-    direction = true;                  // Por defecto: DIRECTA
-    ioController.setRelay(1, true);    // Encender relé 2 (dirección directa)
+    direction = true;
+    ioController.setRelay(1, true);
 
     Serial.println("⚙️ Estado inicial: Dirección DIRECTA (Relé 2 ON)");
 
     // Configurar ISRs genéricas
     gpio_install_isr_service(ESP_INTR_FLAG_LEVEL3);
     
-    // Fase A - dev = 0
     gpio_set_intr_type((gpio_num_t)zcPins[0], GPIO_INTR_POSEDGE);
     gpio_isr_handler_add((gpio_num_t)zcPins[0], zcISR_Generic, (void*)0);
     
-    // Fase B - dev = 1  
     gpio_set_intr_type((gpio_num_t)zcPins[1], GPIO_INTR_POSEDGE);
     gpio_isr_handler_add((gpio_num_t)zcPins[1], zcISR_Generic, (void*)1);
     
-    // Fase C - dev = 2
     gpio_set_intr_type((gpio_num_t)zcPins[2], GPIO_INTR_POSEDGE);
     gpio_isr_handler_add((gpio_num_t)zcPins[2], zcISR_Generic, (void*)2);
     
@@ -474,14 +440,20 @@ void setup() {
         esp_timer_create(&fireArgs, &fireTimers[i]);
     }
 
+    // CREAR TASKS GENÉRICAS
     xTaskCreate(digitalInputTask, "inputTask", 4096, NULL, 1, NULL);
-    xTaskCreate(controlTaskFaseA, "ctrlA", 4096, NULL, 3, NULL);
-    xTaskCreate(controlTaskFaseB, "ctrlB", 4096, NULL, 3, NULL);
-    xTaskCreate(controlTaskFaseC, "ctrlC", 4096, NULL, 3, NULL);
+    
+    // Tasks de control genéricas
+    xTaskCreate(controlTaskGeneric, "ctrlA", 4096, (void*)0, 5, NULL); // Queue 0 = Fase A
+    xTaskCreate(controlTaskGeneric, "ctrlB", 4096, (void*)1, 5, NULL); // Queue 1 = Fase B
+    xTaskCreate(controlTaskGeneric, "ctrlC", 4096, (void*)2, 5, NULL); // Queue 2 = Fase C
 
     i2cQueue = xQueueCreate(5, sizeof(I2CRequest));
     xTaskCreate(i2cManagerTask, "I2C Manager", 4096, NULL, 2, NULL);
     xTaskCreate(adsReadTask, "ADS Read Task", 4096, NULL, 3, NULL);
+
+    // Configurar Watchdog
+    esp_task_wdt_init(30, false);
 
     Serial.println("=== SETUP COMPLETADO ===");
 }
