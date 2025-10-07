@@ -18,6 +18,15 @@ Sensores sensores;
 const int zcPins[NUM_DEVICES]  = {38, 47, 14};
 const int scrPins[NUM_DEVICES] = {48, 21, 13};
 
+// ================== VARIABLES PARA CONTROL POR ONDAS COMPLETAS ==================
+volatile uint32_t zcPairCount[NUM_DEVICES] = {0};        // Contador de PARES de ZC
+volatile uint32_t wavesToSkip[NUM_DEVICES] = {0};        // Ondas completas a saltar
+volatile bool expectingSecondZC[NUM_DEVICES] = {false};  // Esperando 2do ZC del par
+const uint32_t SAFE_MAX_DELAY = 8000;      // Límite seguro superior
+const uint32_t USEFUL_MIN_DELAY = 7400;    // ← NUEVO: Límite inferior útil
+const uint32_t ABSOLUTE_MAX_DELAY = 8100;  // Para apagado completo
+const uint32_t ABSOLUTE_MIN_DELAY = 4000;  // Mínimo absoluto (pero no lo usaremos en el rango ú
+
 // Control y medición
 volatile uint32_t lastZCTime[NUM_DEVICES] = {0};
 volatile bool scrActive[NUM_DEVICES] = {false};
@@ -73,44 +82,10 @@ void IRAM_ATTR forceTurnOffSCR(uint8_t dev) {
 }
 
 void updateSCREnabledStates(int percentage) {
-    static int lastPercentage = -1;
     bool newEnabledStates[NUM_DEVICES];
-    
-    newEnabledStates[0] = true;
-    newEnabledStates[1] = true;
-    newEnabledStates[2] = true;
-    if (percentage == lastPercentage) return;
-    lastPercentage = percentage;
-
-    int newActiveCount = 0;
-
-    if (percentage <= SCR_1_PHASE_THRESHOLD) {
-        newEnabledStates[0] = true;
-        newEnabledStates[1] = false;
-        newEnabledStates[2] = false;
-        newActiveCount = 1;
-        if (percentage > 0) Serial.printf("[SCR] Modo 1-FASE (A) - %d%%\n", percentage);
-    } else if (percentage <= SCR_2_PHASE_THRESHOLD) {
-        newEnabledStates[0] = true;
-        newEnabledStates[1] = true;
-        newEnabledStates[2] = false;
-        newActiveCount = 2;
-        Serial.printf("[SCR] Modo 2-FASES (A+B) - %d%%\n", percentage);
-    } else {
-        newEnabledStates[0] = true;
-        newEnabledStates[1] = true;
-        newEnabledStates[2] = true;
-        newActiveCount = 3;
-        Serial.printf("[SCR] Modo 3-FASES (A+B+C) - %d%%\n", percentage);
-    }
-
     for (int i = 0; i < NUM_DEVICES; i++) {
-        scrEnabled[i] = newEnabledStates[i];
-        if (!scrEnabled[i] && scrActive[i]) {
-            forceTurnOffSCR(i);
-        }
+        scrEnabled[i] = true;
     }
-    activeSCRsCount = newActiveCount;
 }
 
 // Estructura para pasar datos de ISR a task
@@ -119,98 +94,66 @@ typedef struct {
     uint32_t delay_us;
 } ZCEvent_t;
 
-// ISR zero crossing CORREGIDAS
-void IRAM_ATTR zcISR_FaseA(void* arg) {
-    if (!systemStarted || !scrEnabled[0]) return;
+void IRAM_ATTR zcISR_Generic(void* arg) {
+    uint8_t dev = (uint8_t)(intptr_t)arg;
+    
+    if (!systemStarted || !scrEnabled[dev]) return;
+    
     uint32_t now = micros();
-    zcCount[0]++;
-
-    // Apagar SCR inmediatamente
-    gpio_set_level((gpio_num_t)scrPins[0], 0);
-    scrActive[0] = false;
+    if (now - lastZCTime[dev] > 2) {
+        lastZCTime[dev] = now;
+        zcCount[dev]++;
         
-    // Capturar delay actual para esta fase
-    uint32_t currentDelay = scrDelayUs;
+        // Apagar SCR
+        gpio_set_level((gpio_num_t)scrPins[dev], 0);
+        scrActive[dev] = false;
         
-    if (currentDelay >= 8300) {
-            // No disparar - mantener apagado
-        return;
+        // VERIFICACIÓN DE SEGURIDAD MEJORADA
+        if (scrDelayUs >= ABSOLUTE_MAX_DELAY) {
+            return; // APAGADO COMPLETO - no disparar
+        }
+        
+        // Asegurar que el delay está en zona segura
+        uint32_t safeDelay = scrDelayUs;
+        if (safeDelay > SAFE_MAX_DELAY) {
+            safeDelay = SAFE_MAX_DELAY;
+        }
+        
+        // Contador de semiondas
+        static uint32_t semiWaveCount[NUM_DEVICES] = {0};
+        semiWaveCount[dev]++;
+        
+        // Lógica de control por ondas
+        uint32_t completeWavesToSkip = wavesToSkip[dev];
+        uint32_t totalCycleLength = (completeWavesToSkip + 1) * 2;
+        uint32_t positionInCycle = semiWaveCount[dev] % totalCycleLength;
+        
+        // Conducir solo en las primeras 2 semiondas del ciclo
+        if (positionInCycle < 2 && safeDelay < SAFE_MAX_DELAY) {
+            if (safeDelay <= 100) {
+                // Disparo inmediato
+                gpio_set_level((gpio_num_t)scrPins[dev], 1);
+                scrActive[dev] = true;
+                pulseStartTime[dev] = micros();
+                pulseCount[dev]++;
+            } else {
+                // Disparo con delay seguro
+                uint32_t targetTime = now + safeDelay;
+                while (micros() < targetTime) {
+                    asm volatile ("nop");
+                }
+                gpio_set_level((gpio_num_t)scrPins[dev], 1);
+                scrActive[dev] = true;
+                pulseStartTime[dev] = micros();
+                pulseCount[dev]++;
+            }
+        }
+        
+        // Reset preventivo
+        if (semiWaveCount[dev] > 1000000) {
+            semiWaveCount[dev] = 0;
+        }
     }
-    else if (currentDelay <= 100) {
-        // Disparo inmediato (conducción completa)
-        gpio_set_level((gpio_num_t)scrPins[0], 1);
-        scrActive[0] = true;
-        pulseStartTime[0] = micros();
-        pulseCount[0]++;
-    } else { 
-        // Programar disparo con el MISMO delay
-        BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-        uint8_t dev = 0;
-        xQueueSendFromISR(zcQueues[0], &dev, &xHigherPriorityTaskWoken);
-        if (xHigherPriorityTaskWoken) portYIELD_FROM_ISR();
-    }
-}
-
-void IRAM_ATTR zcISR_FaseB(void* arg) {
-    if (!systemStarted || !scrEnabled[1]) return;
-    uint32_t now = micros();
-        zcCount[1]++;
-        
-        // Apagar SCR inmediatamente
-        gpio_set_level((gpio_num_t)scrPins[1], 0);
-        scrActive[1] = false;
-        
-        // Capturar delay actual para esta fase
-        uint32_t currentDelay = scrDelayUs;
-
-        if (currentDelay >= 8300) {
-            // No disparar - mantener apagado
-            return;
-        }
-        else if (currentDelay <= 100) {
-            // Disparo inmediato (conducción completa)
-            gpio_set_level((gpio_num_t)scrPins[1], 1);
-            scrActive[1] = true;
-            pulseStartTime[1] = micros();
-            pulseCount[1]++;
-        } else {
-            // Programar disparo con el MISMO delay
-            BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-            uint8_t dev = 1;
-            xQueueSendFromISR(zcQueues[1], &dev, &xHigherPriorityTaskWoken);
-            if (xHigherPriorityTaskWoken) portYIELD_FROM_ISR();
-        }
-}
-
-void IRAM_ATTR zcISR_FaseC(void* arg) {
-    if (!systemStarted || !scrEnabled[2]) return;
-    uint32_t now = micros();
-        zcCount[2]++;
-        
-        // Apagar SCR inmediatamente
-        gpio_set_level((gpio_num_t)scrPins[2], 0);
-        scrActive[2] = false;
-        
-        // Capturar delay actual para esta fase
-        uint32_t currentDelay = scrDelayUs;
-
-        if (currentDelay >= 8300) {
-            // No disparar - mantener apagado
-            return;
-        }
-        else if (currentDelay <= 100) {
-            // Disparo inmediato (conducción completa)
-            gpio_set_level((gpio_num_t)scrPins[2], 1);
-            scrActive[2] = true;
-            pulseStartTime[2] = micros();
-            pulseCount[2]++;
-        } else {
-            // Programar disparo con el MISMO delay
-            BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-            uint8_t dev = 2;
-            xQueueSendFromISR(zcQueues[2], &dev, &xHigherPriorityTaskWoken);
-            if (xHigherPriorityTaskWoken) portYIELD_FROM_ISR();
-        }
 }
 
 // Timer callback
@@ -417,6 +360,61 @@ void adsReadTask(void* parameter) {
     }
 }
 
+
+// ================== CÁLCULO PROGRESIVO DE ONDAS SKIPPEADAS ==================
+uint32_t calculateWavesToSkip(int potPercentage) {
+    // Tabla progresiva de skipeo de ondas
+    if (potPercentage == 0) return 50;      // 0% → saltar 50 ondas (mínima corriente)
+    else if (potPercentage <= 5) return 20; // 1-5% → saltar 20 ondas
+    else if (potPercentage <= 10) return 19;// 6-10% → saltar 15 ondas
+    else if (potPercentage <= 15) return 18;// 11-15% → saltar 12 ondas
+    else if (potPercentage <= 20) return 17;// 16-20% → saltar 10 ondas
+    else if (potPercentage <= 25) return 16; // 21-25% → saltar 8 ondas
+    else if (potPercentage <= 30) return 15; // 26-30% → saltar 6 ondas
+    else if (potPercentage <= 35) return 14; // 31-35% → saltar 5 ondas
+    else if (potPercentage <= 40) return 13; // 36-40% → saltar 4 ondas
+    else if (potPercentage <= 45) return 12; // 41-45% → saltar 3 ondas
+    else if (potPercentage <= 50) return 11; // 46-50% → saltar 2 ondas
+    else if (potPercentage <= 60) return 10; // 51-60% → saltar 1 onda
+    else return 0;                          // 61-100% → no saltar ondas
+}
+
+void updateWaveBasedControl() {
+    const float POT_MAX_V = 5.0;
+    const float alpha = 0.15;
+
+    // 1. LECTURA Y FILTRADO
+    float rawV = sensores.getVoltage();
+    rawV = constrain(rawV, 0.0, POT_MAX_V);
+    filteredPotVoltage = alpha * rawV + (1 - alpha) * filteredPotVoltage;
+    float vFiltered = filteredPotVoltage;
+    float potNorm = vFiltered / POT_MAX_V;
+    int potPercentage = (int)(potNorm * 100);
+
+    // 2. CONTROL POR ONDAS (se mantiene igual)
+    uint32_t skipCount = calculateWavesToSkip(potPercentage);
+    
+    for (int dev = 0; dev < NUM_DEVICES; dev++) {
+        if (scrEnabled[dev]) {
+            wavesToSkip[dev] = skipCount;
+        }
+    }
+
+    // 3. CÁLCULO DE DELAY EN RANGO ÚTIL 8200-7500µs
+    // Mapeo: 0V → 8200µs, 5V → 7500µs
+    scrDelayUs = SAFE_MAX_DELAY - (uint32_t)(potNorm * (SAFE_MAX_DELAY - USEFUL_MIN_DELAY));
+
+    // 4. LÍMITES DEL RANGO ÚTIL
+    if (scrDelayUs > SAFE_MAX_DELAY) scrDelayUs = SAFE_MAX_DELAY;
+    if (scrDelayUs < USEFUL_MIN_DELAY) scrDelayUs = USEFUL_MIN_DELAY;
+
+    // 5. APAGADO COMPLETO
+    if (vFiltered < 0.1) scrDelayUs = ABSOLUTE_MAX_DELAY;
+
+    // 6. ACTUALIZAR SCR
+    updateSCREnabledStates(potPercentage);
+}
+
 // ================== SETUP CORREGIDO ==================
 void setup() {
     Serial.begin(115200);
@@ -450,14 +448,21 @@ void setup() {
 
     Serial.println("⚙️ Estado inicial: Dirección DIRECTA (Relé 2 ON)");
 
+    // Configurar ISRs genéricas
     gpio_install_isr_service(ESP_INTR_FLAG_LEVEL3);
+    
+    // Fase A - dev = 0
     gpio_set_intr_type((gpio_num_t)zcPins[0], GPIO_INTR_POSEDGE);
-    gpio_isr_handler_add((gpio_num_t)zcPins[0], zcISR_FaseA, NULL);
+    gpio_isr_handler_add((gpio_num_t)zcPins[0], zcISR_Generic, (void*)0);
+    
+    // Fase B - dev = 1  
     gpio_set_intr_type((gpio_num_t)zcPins[1], GPIO_INTR_POSEDGE);
-    gpio_isr_handler_add((gpio_num_t)zcPins[1], zcISR_FaseB, NULL);
+    gpio_isr_handler_add((gpio_num_t)zcPins[1], zcISR_Generic, (void*)1);
+    
+    // Fase C - dev = 2
     gpio_set_intr_type((gpio_num_t)zcPins[2], GPIO_INTR_POSEDGE);
-    gpio_isr_handler_add((gpio_num_t)zcPins[2], zcISR_FaseC, NULL);
-
+    gpio_isr_handler_add((gpio_num_t)zcPins[2], zcISR_Generic, (void*)2);
+    
     for (int i = 0; i < NUM_DEVICES; i++) {
         esp_timer_create_args_t fireArgs = {
             .callback = &timerCallback,
@@ -481,10 +486,10 @@ void setup() {
     Serial.println("=== SETUP COMPLETADO ===");
 }
 
-// ================== LOOP CORREGIDO ==================
+// ================== LOOP CON LOG PROGRESIVO ==================
 void loop() {
     processSerialCommands();
-    updateSCREnabledStates(sensores.getPotPercentage());
+    updateWaveBasedControl();
 
     // START con retardo de 3 segundos
     if (startRequested && !systemStarted) {
@@ -496,67 +501,36 @@ void loop() {
         }
     }
 
+    // LOG periódico
     static uint32_t lastLog = 0;
-    
-    // ================== POTENCIÓMETRO Y CONTROL SCR ==================
-    const float POT_MAX_V = 5.0;
-    const uint32_t MIN_DELAY_US = 4000; // límite inferior (conducción máxima)
-    const uint32_t MAX_DELAY_US = SEMI_PERIOD_US; // límite superior (apagado)
-    const float alpha = 0.15; // Filtro EMA
-
-    // Lectura del potenciómetro
-    float rawV = sensores.getVoltage();   // valor leido por ADS1115 (0.0–5.0)
-    rawV = constrain(rawV, 0.0, POT_MAX_V);
-
-    // Filtro exponencial suavizado
-    filteredPotVoltage = alpha * rawV + (1 - alpha) * filteredPotVoltage;
-
-    // Usamos el valor filtrado
-    float vFiltered = filteredPotVoltage;
-    float norm = vFiltered / POT_MAX_V; // 0..1
-
-    // Mapeo lineal: 0V → 8333 µs, 5V → 4000 µs
-    scrDelayUs = MAX_DELAY_US - (uint32_t)(norm * (MAX_DELAY_US - MIN_DELAY_US));
-
-    // Límites y zona muerta
-    if (scrDelayUs > MAX_DELAY_US) scrDelayUs = MAX_DELAY_US;
-    if (scrDelayUs < MIN_DELAY_US) scrDelayUs = MIN_DELAY_US;
-    if (vFiltered < 0.1) scrDelayUs = MAX_DELAY_US; // <100 mV → sin conducción
-
-    // Actualizar delays para todas las fases activas
-    for (int i = 0; i < NUM_DEVICES; i++) {
-        if (scrEnabled[i]) {
-            currentPhaseDelays[i] = scrDelayUs;
-        } else {
-            currentPhaseDelays[i] = 8300; // Apagado para fases deshabilitadas
-        }
-    }
-
+    static uint32_t lastSkipLog = 0;
     if (millis() - lastLog > 500) {
         lastLog = millis();
-        Serial.printf("📊 Pot bruto: %.3fV → filtrado: %.3fV → delay: %lu µs\n",
-                  rawV, filteredPotVoltage, scrDelayUs);
-
-        // Debug de estados de fase
-        Serial.printf("🔧 Fases: A[%s] B[%s] C[%s] | Delays: A=%lu B=%lu C=%lu\n",
-            scrEnabled[0] ? "ON" : "OFF", 
-            scrEnabled[1] ? "ON" : "OFF", 
-            scrEnabled[2] ? "ON" : "OFF",
-            currentPhaseDelays[0], currentPhaseDelays[1], currentPhaseDelays[2]);
-
-        for (int i = 0; i < NUM_DEVICES; i++) {
-            if (verboseLog) Serial.printf("   Corriente[%d]: %.3f A\n", i, sensores.getCurrent(i));
+        
+        int potPercentage = (int)((filteredPotVoltage / 5.0) * 100);
+        uint32_t currentSkip = wavesToSkip[0];
+        
+        Serial.printf("📊 Pot: %d%% (%.2fV) | ", potPercentage, filteredPotVoltage);
+        
+        if (currentSkip > 0) {
+            Serial.printf("🌊 Conducir cada %lu ondas | ", currentSkip + 1);
+        } else {
+            Serial.printf("⚡ Conducción continua | ");
         }
         
-        uint8_t inputs = ioController.readAllInputs(); 
+        Serial.printf("Delay: %luµs\n", scrDelayUs);
+        
+        Serial.printf("   🔧 Fases: A[%s] B[%s] C[%s]", 
+            scrEnabled[0] ? "ON" : "OFF", 
+            scrEnabled[1] ? "ON" : "OFF", 
+            scrEnabled[2] ? "ON" : "OFF");
+
+        // Log de corrientes si está habilitado
         if (verboseLog) {
-            Serial.print("🔘 Botones: ");
-            for (int i = 0; i < 8; i++) {
-                bool pressed = (inputs & (1 << i)) == 0;
-                Serial.printf("[%d:%s] ", i, pressed ? "ON" : "OFF");
-            }
-            Serial.println();
+            Serial.printf(" | Corrientes: A=%.2fA B=%.2fA C=%.2fA",
+                         sensores.getCurrent(0), sensores.getCurrent(1), sensores.getCurrent(2));
         }
+        Serial.println();
     }
 
     vTaskDelay(50 / portTICK_PERIOD_MS);
