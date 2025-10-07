@@ -4,7 +4,6 @@
 
 Sensores::Sensores() 
     : potPercentageLocal(0), voltage(0) {
-    // Inicializar offsets y gains
     for (int i = 0; i < NUM_DEVICES; i++) {
         offsetCurrentLow[i] = 0.0;
         offsetCurrentHigh[i] = 0.0;
@@ -17,7 +16,6 @@ Sensores::Sensores()
 bool Sensores::begin() {
     bool success = true;
     
-    // TOMAR el mutex ANTES de inicializar los ADS1115
     if (!takeI2CMutex(1000)) {
         Serial.println("❌ No se pudo tomar mutex para inicializar ADS1115");
         return false;
@@ -29,7 +27,7 @@ bool Sensores::begin() {
         success = false;
     } else {
         adsLow.setGain(GAIN_TWOTHIRDS);  // ±4.096V
-        adsLow.setDataRate(RATE_ADS1115_860SPS); // ⚡ MÁXIMA VELOCIDAD
+        adsLow.setDataRate(RATE_ADS1115_860SPS);
         Serial.println("✅ ADS1115 (0x48) inicializado");
     }
     
@@ -39,21 +37,79 @@ bool Sensores::begin() {
         success = false;
     } else {
         adsHigh.setGain(GAIN_ONE);  // ±4.096V
-        adsHigh.setDataRate(RATE_ADS1115_128SPS); // ⚡ MÁXIMA VELOCIDAD
+        adsHigh.setDataRate(RATE_ADS1115_860SPS); // ⚡ MÁXIMA VELOCIDAD
         Serial.println("✅ ADS1115 (0x49) inicializado");
     }
     
-    // LIBERAR el mutex después de inicializar
     giveI2CMutex();
-    
-    // Cargar calibración
     loadCalibration();
     
     return success;
 }
 
-// ⚡ LECTURA RÁPIDA SIN PROMEDIO (para uso en tiempo real)
+// ⚡ LECTURA ULTRA RÁPIDA - SOLO LECTURAS CRÍTICAS
+bool Sensores::readAllSensors(float* results, uint8_t numChannels) {
+    static uint32_t lastReadTime = 0;
+    static uint32_t readCounter = 0;
+    
+    // Solo leer cada 200ms para reducir carga (opcional)
+    if (millis() - lastReadTime < 200 && readCounter > 0) {
+        return true; // Usar valores anteriores
+    }
+    
+    if (!takeI2CMutex(15, "ADS_READ_ALL")) {   // ⚡ Timeout MUY corto
+        return false; // No log, just fail silently
+    }
+    
+    uint32_t startTime = micros();
+    bool success = true;
+
+    // ⚡ LECTURA DIRECTA SIN VERIFICACIONES EXTRA
+    try {
+        // 1. Potenciómetro (más importante)
+        int16_t potRaw = adsLow.readADC_SingleEnded(POT_CHANNEL);
+        voltage = (potRaw * 0.1875) / 1000.0;
+        potPercentageLocal = constrain((voltage / 5.0) * 100.0, 0, 100);
+        ::potPercentage = (uint32_t)potPercentageLocal;
+
+        // 2. Corrientes fase A y B (lectura rápida)
+        for (int dev = 0; dev < 2; dev++) {
+            int16_t raw = adsLow.readADC_SingleEnded(CURRENT_CHANNELS[dev]);
+            float vSense = raw * 0.1875 / 1000.0;
+            current[dev] = vSense * 100.0f; // Conversión simplificada
+            if (fabs(current[dev]) < 2.0f) current[dev] = 0.0f;
+        }
+
+        // 3. Corriente fase C (diferencial) - SOLO si es crítica
+        if (readCounter % 2 == 0) { // Leer cada 2 ciclos para reducir carga
+            int16_t raw = adsHigh.readADC_Differential_0_1();
+            float vSense = raw * 7.8125e-6f; // LSB para GAIN_ONE
+            
+            static float currentEMA = 0.0f;
+            const float alpha = 0.3f;
+            float ampsInstant = vSense * 200.0f;
+            currentEMA = (1 - alpha) * currentEMA + alpha * ampsInstant;
+            
+            if (fabs(currentEMA) < 10.0f) currentEMA = 0.0f;
+            current[2] = currentEMA;
+        }
+        
+    } catch (...) {
+        success = false;
+    }
+    
+    giveI2CMutex();
+    
+    readCounter++;
+    lastReadTime = millis();
+    
+    return success;
+}
+
+// 🔄 MANTENER LAS OTRAS FUNCIONES PERO CON TIMEOUTS MÁS CORTOS
 float Sensores::readSingle(Adafruit_ADS1115& ads, uint8_t channel, bool differential, float gain) {
+    if (!takeI2CMutex(10, "ADS_SINGLE")) return 0.0;
+    
     int16_t raw;
     if (differential) {
         switch (channel) {
@@ -64,13 +120,15 @@ float Sensores::readSingle(Adafruit_ADS1115& ads, uint8_t channel, bool differen
     } else {
         raw = ads.readADC_SingleEnded(channel);
     }
-    return raw * gain / 1000.0;  // Convertir a voltios
+    
+    giveI2CMutex();
+    return raw * gain / 1000.0;
 }
 
-// 📊 LECTURA CON PROMEDIO (para calibración y mediciones precisas)
 float Sensores::readAveraged(Adafruit_ADS1115& ads, uint8_t channel, bool differential, float gain, int samples) {
-    if (samples <= 0) samples = 1;
+    if (!takeI2CMutex(20, "ADS_AVG")) return 0.0;
     
+    if (samples <= 0) samples = 1;
     long sum = 0;
     for (int i = 0; i < samples; i++) {
         int16_t raw;
@@ -84,95 +142,13 @@ float Sensores::readAveraged(Adafruit_ADS1115& ads, uint8_t channel, bool differ
             raw = ads.readADC_SingleEnded(channel);
         }
         sum += raw;
-        if (i < samples - 1) delay(1); // Pequeño delay entre lecturas
     }
     
-    float average = (float)sum / samples;
-    return average * gain / 1000.0;  // Convertir a voltios
-}
-
-// 🎯 LECTURA OPTIMIZADA PARA EL SISTEMA EN TIEMPO REAL
-bool Sensores::readAllSensors(float* results, uint8_t numChannels) {
-     if (!takeI2CMutex(500,"ADS_READ_ALL")) {   // espera hasta 500ms
-        if(verboseLog) Serial.println("❌ No se pudo tomar mutex en readAllSensors");
-        return false;
-    }
-    
-    uint32_t startTime = micros();
-    bool success = true;
-
-    bool lowOK = false, highOK = false;
-    
-    // Verificar dispositivos rápidamente
-    Wire.beginTransmission(ADS1115_ADDRESS_LOW);
-    lowOK = (Wire.endTransmission() == 0);
-    
-    Wire.beginTransmission(ADS1115_ADDRESS_HIGH);  
-    highOK = (Wire.endTransmission() == 0);
-    
-    if (lowOK) {
-        int16_t potRaw = adsLow.readADC_SingleEnded(POT_CHANNEL);
-        voltage = (potRaw * 0.1875) / 1000.0;
-        potPercentageLocal = constrain((voltage / 5.0) * 100.0, 0, 100);
-        ::potPercentage = (uint32_t)potPercentageLocal;
-    } else {
-        success = false;
-    }
-
-    if (lowOK || highOK) {
-        for (int dev = 0; dev < NUM_DEVICES; dev++) {
-            int16_t raw = 0;
-            bool devOK = false;
-
-            if (dev < 2 && lowOK) {                          // los dos primeros single-ended en 0x48
-                raw = adsLow.readADC_SingleEnded(CURRENT_CHANNELS[dev]);
-                devOK = true;
-            } 
-            
-            else if (dev == 2 && highOK) {  // Corriente real en diferencial 0–1 de 0x49
-                // Leer una única conversión diferencial estable
-                int16_t raw = adsHigh.readADC_Differential_0_1();
-
-                // LSB para GAIN_ONE (±4.096 V) = 125 µV/bit
-                const float LSB_V = 7.8125e-6f;
-                float vSense = raw * LSB_V;  // en voltios
-
-                // Calibración empírica: 215 mV = 3300 A → 1 V = 15348 A
-                float ampsInstant = vSense * 200.0f;
-
-                // Filtro EMA (suavizado)
-                static float currentEMA = 0.0f;
-                const float alpha = 0.12f;  // 0.1 = más suave, 0.3 = más rápido
-                currentEMA = (1 - alpha) * currentEMA + alpha * ampsInstant;
-
-                // Zona muerta y límites
-                if (fabs(currentEMA) < 10.0f) currentEMA = 0.0f;
-                currentEMA = constrain(currentEMA, 0.0f, 6000.0f);
-
-                current[dev] = currentEMA;
-
-                Serial.printf("[ADS49] raw=%d | %.6f mV | %.1f A\n",
-                                raw, vSense*1000, current[dev]);
-                
-
-                devOK = true;
-            }
-        }
-    }            
-        else {
-        success = false;
-    }
-
     giveI2CMutex();
-    
-    uint32_t duration = micros() - startTime;
-    if (duration > 3000) {
-        if (verboseLog) Serial.printf("⚠️ Sensores lentos: %luμs\n", duration);
-    }
-    
-    return success;
+    return ((float)sum / samples) * gain / 1000.0;
 }
 
+// ... resto de funciones con timeouts cortos ...
 float Sensores::readADSChannel(uint8_t adsIndex, uint8_t channel, bool differential) {
     if (!takeI2CMutex(100,"ADS_READ_CHANNEL")) {
         if (verboseLog) Serial.println("❌ [Sensores] Timeout en readADSChannel");
