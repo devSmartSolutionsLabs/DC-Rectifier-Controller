@@ -7,6 +7,7 @@
 #include "MCP23017_IO.hpp"
 #include "GlobalVars.hpp"
 #include "mutexDebug.hpp"
+#include "esp_task_wdt.h"
 
 // ================== Variables Globales ==================
 QueueHandle_t zcQueues[NUM_DEVICES] = {NULL, NULL, NULL};
@@ -22,10 +23,10 @@ const int scrPins[NUM_DEVICES] = {48, 21, 13};
 volatile uint32_t zcPairCount[NUM_DEVICES] = {0};        // Contador de PARES de ZC
 volatile uint32_t wavesToSkip[NUM_DEVICES] = {0};        // Ondas completas a saltar
 volatile bool expectingSecondZC[NUM_DEVICES] = {false};  // Esperando 2do ZC del par
-const uint32_t SAFE_MAX_DELAY = 8000;      // Límite seguro superior
-const uint32_t USEFUL_MIN_DELAY = 7400;    // ← NUEVO: Límite inferior útil
-const uint32_t ABSOLUTE_MAX_DELAY = 8100;  // Para apagado completo
-const uint32_t ABSOLUTE_MIN_DELAY = 4000;  // Mínimo absoluto (pero no lo usaremos en el rango ú
+const uint32_t SAFE_MAX_DELAY = 7950;      // ⚡ Cambiado a 8300
+const uint32_t USEFUL_MIN_DELAY = 6000;    // ⚡ Cambiado a 7000
+const uint32_t ABSOLUTE_MAX_DELAY = 8000;  // ⚡ Cambiado a 8300
+const uint32_t ABSOLUTE_MIN_DELAY = 5500;  // ⚡ Cambiado a 7000
 
 // Control y medición
 volatile uint32_t lastZCTime[NUM_DEVICES] = {0};
@@ -36,7 +37,7 @@ volatile uint32_t pulseCount[NUM_DEVICES] = {0};
 volatile uint32_t zcCount[NUM_DEVICES] = {0};
 
 // Para capturar delay en momento del zero crossing
-volatile uint32_t currentPhaseDelays[NUM_DEVICES] = {8300, 8300, 8300};
+volatile uint32_t currentPhaseDelays[NUM_DEVICES] = {8200, 8200, 8200};
 
 // Botón START
 int startButtonPin = -1;
@@ -88,81 +89,135 @@ void updateSCREnabledStates(int percentage) {
     }
 }
 
-// Estructura para pasar datos de ISR a task
-typedef struct {
-    uint8_t dev;
-    uint32_t delay_us;
-} ZCEvent_t;
+// ================== TIMER CALLBACK - NUEVA FUNCIÓN ==================
+void IRAM_ATTR fireTimerCallback(void* arg) {
+    uint8_t dev = (uint8_t)(intptr_t)arg;
+    
+    // ⚡ ESTO SE EJECUTA AUTOMÁTICAMENTE DESPUÉS DEL DELAY PROGRAMADO
+    // SIN BLOQUEAR NINGUNA TASK
+    if (scrEnabled[dev] && systemStarted) {
+        gpio_set_level((gpio_num_t)scrPins[dev], 1);
+        scrActive[dev] = true;
+        pulseStartTime[dev] = micros();
+        pulseCount[dev]++;
+        
+        // Debug del primer disparo con timer
+        static bool firstFire[3] = {true, true, true};
+        if (firstFire[dev]) {
+            Serial.printf("[TIMER%c] Primer disparo con timer HW\n", 'A' + dev);
+            firstFire[dev] = false;
+        }
+    }
+}
 
-// ================== ISR SIN BUSY-WAIT ==================
+// ================== ISR CORREGIDA - EXACTAMENTE 2 PULSOS ==================
 void IRAM_ATTR zcISR_Generic(void* arg) {
     uint8_t dev = (uint8_t)(intptr_t)arg;
     
     if (!systemStarted || !scrEnabled[dev]) return;
     
     uint32_t now = micros();
-    if (now - lastZCTime[dev] > 2) {
+    if (now - lastZCTime[dev] > 1800) {
         lastZCTime[dev] = now;
         zcCount[dev]++;
         
-        // Apagar SCR inmediatamente
+        // 1. APAGAR SCR inmediatamente
         gpio_set_level((gpio_num_t)scrPins[dev], 0);
         scrActive[dev] = false;
         
-        // VERIFICACIÓN DE SEGURIDAD
+        // 2. VERIFICACIÓN BÁSICA
         if (scrDelayUs >= ABSOLUTE_MAX_DELAY) {
             return; // APAGADO COMPLETO
         }
         
-        // Asegurar que el delay está en zona segura
-        uint32_t safeDelay = scrDelayUs;
-        if (safeDelay > SAFE_MAX_DELAY) {
-            safeDelay = SAFE_MAX_DELAY;
+        // 3. ⚡ LÓGICA CORREGIDA - EXACTAMENTE 2 PULSOS CONSECUTIVOS
+        static uint32_t waveCount[NUM_DEVICES] = {0, 0, 0};
+        static uint8_t consecutivePulses[NUM_DEVICES] = {0, 0, 0}; // ⚡ Cambiado a uint8_t
+        uint32_t wavesToSkipCurrent = wavesToSkip[dev];
+        
+        bool shouldFire = false;
+        
+        if (wavesToSkipCurrent == 0) {
+            // Disparar en cada semi-onda (máxima potencia)
+            shouldFire = true;
+            consecutivePulses[dev] = 0; // Reset
+        } else {
+            // ⚡ LÓGICA CORREGIDA:
+            // - Disparar exactamente 2 veces consecutivas
+            // - Luego saltar exactamente N ondas
+            uint32_t totalCycleLength = wavesToSkipCurrent + 2; // 2 pulsos + N skips
+            
+            // Determinar posición en el ciclo
+            uint32_t cyclePosition = waveCount[dev] % totalCycleLength;
+            
+            // Disparar solo en las primeras 2 posiciones del ciclo
+            shouldFire = (cyclePosition < 2);
+            
+            // Actualizar contador de pulsos consecutivos para debug
+            if (shouldFire) {
+                consecutivePulses[dev]++;
+            } else {
+                consecutivePulses[dev] = 0;
+            }
+            
+            // Incrementar contador de ondas
+            waveCount[dev]++;
         }
         
-        // Contador de semiondas
-        static uint32_t semiWaveCount[NUM_DEVICES] = {0};
-        semiWaveCount[dev]++;
-        
-        // Lógica de control por ondas
-        uint32_t completeWavesToSkip = wavesToSkip[dev];
-        uint32_t totalCycleLength = (completeWavesToSkip + 1) * 2;
-        uint32_t positionInCycle = semiWaveCount[dev] % totalCycleLength;
-        
-        // Conducir solo en las primeras 2 semiondas del ciclo
-        if (positionInCycle < 2 && safeDelay < SAFE_MAX_DELAY) {
-            if (safeDelay <= 100) {
-                // Disparo inmediato (sin busy-wait)
-                gpio_set_level((gpio_num_t)scrPins[dev], 1);
-                scrActive[dev] = true;
-                pulseStartTime[dev] = micros();
-                pulseCount[dev]++;
-            } else {
-                // Programar timer para disparo retardado (NO busy-wait en ISR)
-                BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-                uint8_t devToFire = dev;
-                xQueueSendFromISR(zcQueues[dev], &devToFire, &xHigherPriorityTaskWoken);
-                if (xHigherPriorityTaskWoken) portYIELD_FROM_ISR();
+        // 4. PROGRAMAR TIMER SOLO SI DEBE DISPARAR
+        if (shouldFire && scrDelayUs < ABSOLUTE_MAX_DELAY) {
+            esp_timer_start_once(fireTimers[dev], scrDelayUs);
+            
+            // Debug del patrón real
+            static uint32_t lastPatternDebug[3] = {0, 0, 0};
+            if (micros() - lastPatternDebug[dev] > 3000000 && wavesToSkipCurrent > 0) { // Cada 3 segundos
+                Serial.printf("[FASE%c] Patrón: %d pulsos → saltar %lu ondas | Ciclo: %lu\n", 
+                             'A' + dev, consecutivePulses[dev], wavesToSkipCurrent, wavesToSkipCurrent + 2);
+                lastPatternDebug[dev] = micros();
             }
         }
         
         // Reset preventivo
-        if (semiWaveCount[dev] > 1000000) {
-            semiWaveCount[dev] = 0;
+        if (waveCount[dev] > 1000000) {
+            waveCount[dev] = 0;
+            consecutivePulses[dev] = 0;
         }
     }
 }
+// ================== WATCHDOG CONFIGURATION ==================
+void enableWatchdog() {
+    esp_task_wdt_init(30, false); // ⚡ Volver a 30 segundos (ahora será estable)
+    esp_task_wdt_add(xTaskGetCurrentTaskHandle());
+}
 
-// Timer callback
-void IRAM_ATTR timerCallback(void* arg) {
-    if (!systemStarted) return;
-    uint8_t dev = (uint8_t)(intptr_t)arg;
+void resetWatchdog() {
+    esp_task_wdt_reset();
+}
+
+// ================== CONTROL TASK SIMPLIFICADA - SOLO MONITOREO ==================
+void controlTaskGeneric(void* param) {
+    uint8_t queueIndex = (uint8_t)(intptr_t)param;
     
-    if (scrEnabled[dev]) {
-        gpio_set_level((gpio_num_t)scrPins[dev], 1);
-        scrActive[dev] = true;
-        pulseStartTime[dev] = micros();
-        pulseCount[dev]++;
+    esp_task_wdt_add(NULL);
+    
+    Serial.printf("[MONITOR%c] Task de monitoreo iniciada\n", 'A' + queueIndex);
+    
+    while (true) {
+        esp_task_wdt_reset();
+        
+        // ⚡ ESTA TASK AHORA SOLO MONITOREA - NO HACE ESPERAS ACTIVAS
+        // El disparo lo hace el timer de hardware automáticamente
+        
+        // Debug del contador cada 10 segundos
+        static uint32_t lastCountLog = 0;
+        if (millis() - lastCountLog > 10000) {
+            Serial.printf("[FASE%c] Pulsos totales: %lu\n", 'A' + queueIndex, pulseCount[queueIndex]);
+            lastCountLog = millis();
+        }
+        
+        // ⚡ PAUSA LARGA - LA CPU ESTÁ LIBRE!
+        vTaskDelay(2000 / portTICK_PERIOD_MS); // 2 segundos
+        esp_task_wdt_reset();
     }
 }
 
@@ -180,12 +235,19 @@ bool requestMCP23017Read(uint8_t reg, uint8_t* result) {
 
 void i2cManagerTask(void *pvParameters) {
     I2CRequest req;
+    
+    esp_task_wdt_add(NULL);
+    
     for (;;) {
-        if (xQueueReceive(i2cQueue, &req, portMAX_DELAY) == pdTRUE) {
+        esp_task_wdt_reset();
+        
+        if (xQueueReceive(i2cQueue, &req, pdMS_TO_TICKS(100)) == pdTRUE) {
+            esp_task_wdt_reset();
+            
             switch (req.device) {
                 case DEV_ADS1115:
                     if (!req.isWrite && req.resultF) {
-                        if (takeI2CMutex(300, "i2cManager-ADS")) {
+                        if (takeI2CMutex(100, "i2cManager-ADS")) {
                             *req.resultF = readADSSafe(req.address, req.reg);
                             giveI2CMutex("i2cManager-ADS");
                         }
@@ -193,14 +255,19 @@ void i2cManagerTask(void *pvParameters) {
                     break;
                 case DEV_MCP23017:
                     if (!req.isWrite && req.resultB) {
-                        if (takeI2CMutex(300, "i2cManager-MCP")) {
+                        if (takeI2CMutex(100, "i2cManager-MCP")) {
                             *req.resultB = readMCP23017Safe(req.address, req.reg);
                             giveI2CMutex("i2cManager-MCP");
                         }
                     }
                     break;
             }
+            
+            esp_task_wdt_reset();
         }
+        
+        vTaskDelay(50 / portTICK_PERIOD_MS);
+        esp_task_wdt_reset();
     }
 }
 
@@ -215,7 +282,6 @@ void handleInputChange(uint8_t inputNumber, bool state) {
                 Serial.println("🛑 START liberado, apagando sistema");
                 startRequested = false;
                 systemStarted = false;
-                // Apagar todos los SCRs
                 for (int i = 0; i < NUM_DEVICES; i++) {
                     forceTurnOffSCR(i);
                 }
@@ -225,12 +291,12 @@ void handleInputChange(uint8_t inputNumber, bool state) {
         
         case 1: // Botón DIRECCIÓN
             if (state) {
-                direction = false;  // Presionado = INVERSA
-                ioController.setRelay(1, false);   // Relé 2 OFF
+                direction = false;
+                ioController.setRelay(1, false);
                 Serial.println("🔄 Dirección: INVERSA (Relé 2 OFF)");
             } else {
-                direction = true;  // Suelto = DIRECTA
-                ioController.setRelay(1, true);    // Relé 2 ON
+                direction = true;
+                ioController.setRelay(1, true);
                 Serial.println("🔄 Dirección: DIRECTA (Relé 2 ON)");
             }
             break;
@@ -242,124 +308,117 @@ void handleInputChange(uint8_t inputNumber, bool state) {
     }
 }
 
-// ========== LECTURA DIGITAL ==========
+// ================== VARIABLE GLOBAL PARA ESTADO DE INPUTS ==================
+static uint8_t lastKnownInputStates = 0xFF;
+
 void processInputChanges(uint8_t currentStates) {
     static uint8_t lastStates = 0xFF;
     static uint32_t lastDebounceTime = 0;
     
+    if (currentStates == 0xFF) {
+        currentStates = lastKnownInputStates;
+    } else {
+        lastKnownInputStates = currentStates;
+    }
+    
     if (currentStates == lastStates) return;
-    if (millis() - lastDebounceTime < 50) return;
+    if (millis() - lastDebounceTime < 100) return;
     lastDebounceTime = millis();
     
     for (int i = 0; i < 8; i++) {
         bool currentState = (currentStates & (1 << i)) == 0;
         bool lastState = (lastStates & (1 << i)) == 0;
+        
         if (currentState != lastState) {
+            Serial.printf("🔘 Entrada %d: %s -> %s\n", 
+                         i, lastState ? "ACTIVO" : "INACTIVO", 
+                         currentState ? "ACTIVO" : "INACTIVO");
             handleInputChange(i, currentState);
         }
     }
     lastStates = currentStates;
 }
 
-// ================== DIGITAL INPUT TASK ==================
-void digitalInputTask(void* parameter) {
-    const TickType_t xFrequency = pdMS_TO_TICKS(100);
+// ================== TASKS OPTIMIZADAS ==================
+void adsReadTask(void* parameter) {
+    const TickType_t xFrequency = pdMS_TO_TICKS(3000); // ⚡ Cada 3 segundos
     TickType_t xLastWakeTime = xTaskGetTickCount();
-    while (true) {
-        uint8_t inputStates = ioController.readAllInputs();
-        processInputChanges(inputStates);
-        vTaskDelayUntil(&xLastWakeTime, xFrequency);
-    }
-}
-
-// ================== CONTROL TASK GENÉRICA ==================
-void controlTaskGeneric(void* param) {
-    uint8_t queueIndex = (uint8_t)(intptr_t)param; // 0, 1 o 2
-    uint8_t dev;
+    
+    esp_task_wdt_add(NULL);
     
     while (true) {
-        if (xQueueReceive(zcQueues[queueIndex], &dev, portMAX_DELAY) == pdTRUE) {
-            if (!systemStarted) { 
-                forceTurnOffSCR(dev); 
-                continue; 
-            }
-            
-            uint32_t currentDelay = scrDelayUs;
-            
-            if (currentDelay >= SAFE_MAX_DELAY) {  
-                continue;
-            }
-            else if (currentDelay < SAFE_MAX_DELAY && currentDelay > 100) {
-                // HACER BUSY-WAIT EN LA TASK (no en ISR)
-                uint32_t targetTime = micros() + currentDelay;
-                while (micros() < targetTime) {
-                    asm volatile ("nop");
-                }
-                
-                // Verificar que todavía esté habilitado antes de disparar
-                if (scrEnabled[dev] && systemStarted) {
-                    gpio_set_level((gpio_num_t)scrPins[dev], 1);
-                    scrActive[dev] = true;
-                    pulseStartTime[dev] = micros();
-                    pulseCount[dev]++;
-                    
-                    if (verboseLog && pulseCount[dev] % 50 == 0) {
-                        Serial.printf("[Fase%c] Disparo retardado: %luµs\n", 
-                                     'A' + dev, currentDelay);
-                    }
-                }
-            }
-        }
-    }
-}
-
-// ================== ADS READ TASK ==================
-void adsReadTask(void* parameter) {
-    const TickType_t xFrequency = pdMS_TO_TICKS(1000);
-    TickType_t xLastWakeTime = xTaskGetTickCount();
-    while (true) {
-        bool success = sensores.readAllSensors(nullptr, 0);
-        if (!success) {
-            if (verboseLog) {
-                Serial.println("❌ Fallo lectura ADS - Skipping ciclo");
-            }
-        }
+        esp_task_wdt_reset();
+        
+        sensores.readAllSensors(nullptr, 0);
+        
         vTaskDelayUntil(&xLastWakeTime, xFrequency);
+        esp_task_wdt_reset();
     }
 }
 
+void digitalInputTask(void* parameter) {
+    const TickType_t xFrequency = pdMS_TO_TICKS(1500); // ⚡ Cada 1.5 segundos
+    TickType_t xLastWakeTime = xTaskGetTickCount();
+    
+    esp_task_wdt_add(NULL);
+    
+    while (true) {
+        esp_task_wdt_reset();
+        
+        uint8_t inputStates = ioController.readAllInputs();
+        processInputChanges(inputStates);
+        
+        vTaskDelayUntil(&xLastWakeTime, xFrequency);
+        esp_task_wdt_reset();
+    }
+}
 
-// ================== CÁLCULO PROGRESIVO DE ONDAS SKIPPEADAS ==================
+// ================== CONTROL POTENCIÓMETRO ==================
 uint32_t calculateWavesToSkip(int potPercentage) {
     // Tabla progresiva de skipeo de ondas
     if (potPercentage == 0) return 50;      // 0% → saltar 50 ondas (mínima corriente)
-    else if (potPercentage <= 5) return 20; // 1-5% → saltar 20 ondas
-    else if (potPercentage <= 10) return 19;// 6-10% → saltar 15 ondas
-    else if (potPercentage <= 15) return 18;// 11-15% → saltar 12 ondas
-    else if (potPercentage <= 20) return 17;// 16-20% → saltar 10 ondas
-    else if (potPercentage <= 25) return 16; // 21-25% → saltar 8 ondas
-    else if (potPercentage <= 30) return 15; // 26-30% → saltar 6 ondas
-    else if (potPercentage <= 35) return 14; // 31-35% → saltar 5 ondas
-    else if (potPercentage <= 40) return 13; // 36-40% → saltar 4 ondas
+    else if (potPercentage <= 5) return 4; // 1-5% → saltar 20 ondas
+    else if (potPercentage <= 10) return 4;// 6-10% → saltar 15 ondas
+    else if (potPercentage <= 15) return 6;// 11-15% → saltar 12 ondas
+    else if (potPercentage <= 20) return 6;// 16-20% → saltar 10 ondas
+    else if (potPercentage <= 25) return 8; // 21-25% → saltar 8 ondas
+    else if (potPercentage <= 30) return 8; // 26-30% → saltar 6 ondas
+    else if (potPercentage <= 35) return 10; // 31-35% → saltar 5 ondas
+    else if (potPercentage <= 40) return 10; // 36-40% → saltar 4 ondas
     else if (potPercentage <= 45) return 12; // 41-45% → saltar 3 ondas
-    else if (potPercentage <= 50) return 11; // 46-50% → saltar 2 ondas
-    else if (potPercentage <= 60) return 10; // 51-60% → saltar 1 onda
+    else if (potPercentage <= 50) return 12; // 46-50% → saltar 2 ondas
+    else if (potPercentage <= 60) return 14; // 51-60% → saltar 1 onda
     else return 0;                          // 61-100% → no saltar ondas
 }
 
 void updateWaveBasedControl() {
-    const float POT_MAX_V = 5.0;
-    const float alpha = 0.15;
+    const float POT_MIN_V = 2.00;  // ⚡ Mínimo útil
+    const float POT_MAX_V = 4.00;  // ⚡ Máximo útil
+    const float alpha = 0.6;
 
-    // 1. LECTURA Y FILTRADO
     float rawV = sensores.getVoltage();
-    rawV = constrain(rawV, 0.0, POT_MAX_V);
-    filteredPotVoltage = alpha * rawV + (1 - alpha) * filteredPotVoltage;
-    float vFiltered = filteredPotVoltage;
-    float potNorm = vFiltered / POT_MAX_V;
-    int potPercentage = (int)(potNorm * 100);
+    
+    // ⚡ MAPEO DIRECTO 2.00V - 4.00V → 0% - 100%
+    float potNorm = 0.0;
+    
+    if (rawV < POT_MIN_V) {
+        // Por debajo de 2.00V → 0% (mínima potencia)
+        potNorm = 0.0;
+    } else if (rawV > POT_MAX_V) {
+        // Por encima de 4.00V → 100% (máxima potencia)
+        potNorm = 1.0;
+    } else {
+        // Entre 2.00V - 4.00V → Mapeo lineal
+        potNorm = (rawV - POT_MIN_V) / (POT_MAX_V - POT_MIN_V);
+    }
+    
+    // Aplicar filtro solo al valor normalizado para suavizar
+    filteredPotVoltage = alpha * potNorm + (1 - alpha) * filteredPotVoltage;
+    float filteredNorm = filteredPotVoltage;
+    
+    int potPercentage = (int)(filteredNorm * 100);
 
-    // 2. CONTROL POR ONDAS (se mantiene igual)
+    // ⚡ CALCULAR SKIP DE ONDAS BASADO EN POTENCIÓMETRO
     uint32_t skipCount = calculateWavesToSkip(potPercentage);
     
     for (int dev = 0; dev < NUM_DEVICES; dev++) {
@@ -368,27 +427,52 @@ void updateWaveBasedControl() {
         }
     }
 
-    // 3. CÁLCULO DE DELAY EN RANGO ÚTIL 8200-7500µs
-    // Mapeo: 0V → 8200µs, 5V → 7500µs
-    scrDelayUs = SAFE_MAX_DELAY - (uint32_t)(potNorm * (SAFE_MAX_DELAY - USEFUL_MIN_DELAY));
+    // CÁLCULO DE DELAY
+    scrDelayUs = SAFE_MAX_DELAY - (uint32_t)(filteredNorm * (SAFE_MAX_DELAY - USEFUL_MIN_DELAY));
+    scrDelayUs = constrain(scrDelayUs, USEFUL_MIN_DELAY, SAFE_MAX_DELAY);
 
-    // 4. LÍMITES DEL RANGO ÚTIL
-    if (scrDelayUs > SAFE_MAX_DELAY) scrDelayUs = SAFE_MAX_DELAY;
-    if (scrDelayUs < USEFUL_MIN_DELAY) scrDelayUs = USEFUL_MIN_DELAY;
+    // APAGADO COMPLETO solo si está muy por debajo del mínimo
+    if (rawV < 1.0) {
+        scrDelayUs = ABSOLUTE_MAX_DELAY;
+        for (int dev = 0; dev < NUM_DEVICES; dev++) {
+            wavesToSkip[dev] = 100;
+        }
+    }
 
-    // 5. APAGADO COMPLETO
-    if (vFiltered < 0.1) scrDelayUs = ABSOLUTE_MAX_DELAY;
-
-    // 6. ACTUALIZAR SCR
     updateSCREnabledStates(potPercentage);
+
+    // ⚡ LOG MEJORADO CON INFO DEL MAPEO
+    static int lastLoggedPercentage = -1;
+    static uint32_t lastSkipCount = 0;
+    static float lastRawV = -1.0;
+    
+    if (potPercentage != lastLoggedPercentage || skipCount != lastSkipCount || abs(rawV - lastRawV) > 0.1) {
+        if (rawV < POT_MIN_V) {
+            Serial.printf("🔻 Raw: %.2fV → Pot: %d%% (FUERA DE RANGO - MÍNIMO)\n", rawV, potPercentage);
+        } else if (rawV > POT_MAX_V) {
+            Serial.printf("🔺 Raw: %.2fV → Pot: %d%% (FUERA DE RANGO - MÁXIMO)\n", rawV, potPercentage);
+        } else {
+            if (skipCount > 0) {
+                Serial.printf("🎛️  Raw: %.2fV → Pot: %d%% → Delay: %luµs | 2 pulsos / %lu ondas\n", 
+                             rawV, potPercentage, scrDelayUs, skipCount + 2);
+            } else {
+                Serial.printf("🎛️  Raw: %.2fV → Pot: %d%% → Delay: %luµs | CONTINUA\n", 
+                             rawV, potPercentage, scrDelayUs);
+            }
+        }
+        lastLoggedPercentage = potPercentage;
+        lastSkipCount = skipCount;
+        lastRawV = rawV;
+    }
 }
 
-// ================== SETUP CORREGIDO ==================
-// ================== SETUP SIMPLIFICADO ==================
+// ================== SETUP CON TIMERS HW ==================
 void setup() {
     Serial.begin(115200);
     delay(1000);
-    Serial.println("=== INICIANDO SISTEMA ===");
+    Serial.println("=== INICIANDO SISTEMA CON TIMERS HW ===");
+
+    enableWatchdog();
 
     pinMode(15, OUTPUT);
     digitalWrite(15, HIGH); 
@@ -406,8 +490,23 @@ void setup() {
         pinMode(zcPins[i], INPUT_PULLDOWN);
         pinMode(scrPins[i], OUTPUT);
         digitalWrite(scrPins[i], LOW);
-        zcQueues[i] = xQueueCreate(10, sizeof(uint8_t));
+        zcQueues[i] = xQueueCreate(5, sizeof(uint8_t)); // ⚡ Cola más pequeña (ya no es crítica)
         currentPhaseDelays[i] = 8300;
+        
+        // ⚡ CONFIGURAR TIMERS DE HARDWARE
+        esp_timer_create_args_t timerArgs = {
+            .callback = &fireTimerCallback,      // ⚡ NUEVO CALLBACK
+            .arg = (void*)(intptr_t)i,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "SCR_Fire_Timer",
+            .skip_unhandled_events = true
+        };
+        
+        if (esp_timer_create(&timerArgs, &fireTimers[i]) == ESP_OK) {
+            Serial.printf("✅ Timer HW Fase %c configurado\n", 'A' + i);
+        } else {
+            Serial.printf("❌ Error creando timer Fase %c\n", 'A' + i);
+        }
     }
 
     sensores.begin();
@@ -417,7 +516,7 @@ void setup() {
 
     Serial.println("⚙️ Estado inicial: Dirección DIRECTA (Relé 2 ON)");
 
-    // Configurar ISRs genéricas
+    // Configurar ISRs
     gpio_install_isr_service(ESP_INTR_FLAG_LEVEL3);
     
     gpio_set_intr_type((gpio_num_t)zcPins[0], GPIO_INTR_POSEDGE);
@@ -428,82 +527,37 @@ void setup() {
     
     gpio_set_intr_type((gpio_num_t)zcPins[2], GPIO_INTR_POSEDGE);
     gpio_isr_handler_add((gpio_num_t)zcPins[2], zcISR_Generic, (void*)2);
-    
-    for (int i = 0; i < NUM_DEVICES; i++) {
-        esp_timer_create_args_t fireArgs = {
-            .callback = &timerCallback,
-            .arg = (void*)(intptr_t)i,
-            .dispatch_method = ESP_TIMER_TASK,
-            .name = "fireTimer",
-            .skip_unhandled_events = false
-        };
-        esp_timer_create(&fireArgs, &fireTimers[i]);
-    }
 
-    // CREAR TASKS GENÉRICAS
+    // CREAR TASKS
     xTaskCreate(digitalInputTask, "inputTask", 4096, NULL, 1, NULL);
-    
-    // Tasks de control genéricas
-    xTaskCreate(controlTaskGeneric, "ctrlA", 4096, (void*)0, 5, NULL); // Queue 0 = Fase A
-    xTaskCreate(controlTaskGeneric, "ctrlB", 4096, (void*)1, 5, NULL); // Queue 1 = Fase B
-    xTaskCreate(controlTaskGeneric, "ctrlC", 4096, (void*)2, 5, NULL); // Queue 2 = Fase C
+    xTaskCreate(controlTaskGeneric, "ctrlA", 4096, (void*)0, 3, NULL); // ⚡ Prioridad más baja
+    xTaskCreate(controlTaskGeneric, "ctrlB", 4096, (void*)1, 3, NULL);
+    xTaskCreate(controlTaskGeneric, "ctrlC", 4096, (void*)2, 3, NULL);
 
     i2cQueue = xQueueCreate(5, sizeof(I2CRequest));
     xTaskCreate(i2cManagerTask, "I2C Manager", 4096, NULL, 2, NULL);
-    xTaskCreate(adsReadTask, "ADS Read Task", 4096, NULL, 3, NULL);
+    xTaskCreate(adsReadTask, "ADS Read Task", 4096, NULL, 2, NULL); // ⚡ Prioridad más baja
 
-    // Configurar Watchdog
-    //esp_task_wdt_init(30, false);
-
-    Serial.println("=== SETUP COMPLETADO ===");
+    Serial.println("=== SETUP COMPLETADO - TIMERS HW ACTIVOS ===");
 }
 
-// ================== LOOP CON LOG PROGRESIVO ==================
+// ================== LOOP OPTIMIZADO ==================
 void loop() {
+    resetWatchdog();
+    
     processSerialCommands();
     updateWaveBasedControl();
 
-    // START con retardo de 3 segundos
+    // START
     if (startRequested && !systemStarted) {
         if (millis() - startRequestTime >= 3000) {
             systemStarted = true;
             startRequested = false;
             ioController.setRelay(0, true);
-            Serial.println("✅ Sistema iniciado, relé ON");
+            Serial.println("✅✅✅ SISTEMA INICIADO - TIMERS HW ACTIVOS ✅✅✅");
         }
     }
 
-    // LOG periódico
-    static uint32_t lastLog = 0;
-    static uint32_t lastSkipLog = 0;
-    if (millis() - lastLog > 500) {
-        lastLog = millis();
-        
-        int potPercentage = (int)((filteredPotVoltage / 5.0) * 100);
-        uint32_t currentSkip = wavesToSkip[0];
-        
-        Serial.printf("📊 Pot: %d%% (%.2fV) | ", potPercentage, filteredPotVoltage);
-        
-        if (currentSkip > 0) {
-            Serial.printf("🌊 Conducir cada %lu ondas | ", currentSkip + 1);
-        } else {
-            Serial.printf("⚡ Conducción continua | ");
-        }
-        
-        Serial.printf("Delay: %luµs\n", scrDelayUs);
-        
-        Serial.printf("   🔧 Fases: A[%s] B[%s] C[%s]", 
-            scrEnabled[0] ? "ON" : "OFF", 
-            scrEnabled[1] ? "ON" : "OFF", 
-            scrEnabled[2] ? "ON" : "OFF");
-
-        // Log de corrientes si está habilitado
-        if (verboseLog) {
-            Serial.printf(" | Corrientes: A=%.2fA B=%.2fA C=%.2fA",
-                         sensores.getCurrent(0), sensores.getCurrent(1), sensores.getCurrent(2));
-        }
-        Serial.println();
-    }
-
-    vTaskDelay(50 / portTICK_PERIOD_MS);
+    vTaskDelay(1000 / portTICK_PERIOD_MS); // ⚡ 1 SEGUNDO - CPU LIBRE
+    resetWatchdog();
 }
