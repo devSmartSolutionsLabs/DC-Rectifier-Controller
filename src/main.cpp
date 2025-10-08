@@ -18,15 +18,17 @@ Sensores sensores;
 // Pines
 const int zcPins[NUM_DEVICES]  = {38, 47, 14};
 const int scrPins[NUM_DEVICES] = {48, 21, 13};
+// ================== TIMERS PARA APAGADO RETARDADO ==================
+esp_timer_handle_t turnOffTimers[NUM_DEVICES];
 
 // ================== VARIABLES PARA CONTROL POR ONDAS COMPLETAS ==================
 volatile uint32_t zcPairCount[NUM_DEVICES] = {0};        // Contador de PARES de ZC
 volatile uint32_t wavesToSkip[NUM_DEVICES] = {0};        // Ondas completas a saltar
 volatile bool expectingSecondZC[NUM_DEVICES] = {false};  // Esperando 2do ZC del par
-const uint32_t SAFE_MAX_DELAY = 7950;      // ⚡ Cambiado a 8300
-const uint32_t USEFUL_MIN_DELAY = 6000;    // ⚡ Cambiado a 7000
-const uint32_t ABSOLUTE_MAX_DELAY = 8000;  // ⚡ Cambiado a 8300
-const uint32_t ABSOLUTE_MIN_DELAY = 5500;  // ⚡ Cambiado a 7000
+const uint32_t SAFE_MAX_DELAY = 8100;      // ⚡ Cambiado a 8300
+const uint32_t USEFUL_MIN_DELAY = 7500;    // ⚡ Cambiado a 7000
+const uint32_t ABSOLUTE_MAX_DELAY = 8110;  // ⚡ Cambiado a 8300
+const uint32_t ABSOLUTE_MIN_DELAY = 7500;  // ⚡ Cambiado a 7000
 
 // Control y medición
 volatile uint32_t lastZCTime[NUM_DEVICES] = {0};
@@ -110,7 +112,20 @@ void IRAM_ATTR fireTimerCallback(void* arg) {
     }
 }
 
-// ================== ISR CORREGIDA - EXACTAMENTE 2 PULSOS ==================
+
+// ================== CALLBACK PARA APAGADO RETARDADO ==================
+void IRAM_ATTR turnOffTimerCallback(void* arg) {
+    uint8_t dev = (uint8_t)(intptr_t)arg;
+    gpio_set_level((gpio_num_t)scrPins[dev], 0);
+    scrActive[dev] = false;
+    
+    if (pulseStartTime[dev] > 0) {
+        pulseDuration[dev] = micros() - pulseStartTime[dev];
+        pulseStartTime[dev] = 0;
+    }
+}
+
+// ================== ISR MODIFICADA - APAGADO RETARDADO ==================
 void IRAM_ATTR zcISR_Generic(void* arg) {
     uint8_t dev = (uint8_t)(intptr_t)arg;
     
@@ -121,69 +136,45 @@ void IRAM_ATTR zcISR_Generic(void* arg) {
         lastZCTime[dev] = now;
         zcCount[dev]++;
         
-        // 1. APAGAR SCR inmediatamente
-        gpio_set_level((gpio_num_t)scrPins[dev], 0);
-        scrActive[dev] = false;
+        // 1. ⚡ PROGRAMAR APAGADO EN 300µs (NO APAGAR INMEDIATAMENTE)
+        if (scrActive[dev]) {
+            esp_timer_start_once(turnOffTimers[dev], 300); // ⚡ Esperar 300µs antes de apagar
+        }
         
         // 2. VERIFICACIÓN BÁSICA
         if (scrDelayUs >= ABSOLUTE_MAX_DELAY) {
             return; // APAGADO COMPLETO
         }
         
-        // 3. ⚡ LÓGICA CORREGIDA - EXACTAMENTE 2 PULSOS CONSECUTIVOS
+        // 3. LÓGICA DE CONTROL (IGUAL QUE ANTES)
         static uint32_t waveCount[NUM_DEVICES] = {0, 0, 0};
-        static uint8_t consecutivePulses[NUM_DEVICES] = {0, 0, 0}; // ⚡ Cambiado a uint8_t
         uint32_t wavesToSkipCurrent = wavesToSkip[dev];
         
         bool shouldFire = false;
         
         if (wavesToSkipCurrent == 0) {
-            // Disparar en cada semi-onda (máxima potencia)
             shouldFire = true;
-            consecutivePulses[dev] = 0; // Reset
+        } else if (wavesToSkipCurrent >= 50) {
+            shouldFire = (waveCount[dev] % (wavesToSkipCurrent + 1) == 0);
         } else {
-            // ⚡ LÓGICA CORREGIDA:
-            // - Disparar exactamente 2 veces consecutivas
-            // - Luego saltar exactamente N ondas
-            uint32_t totalCycleLength = wavesToSkipCurrent + 2; // 2 pulsos + N skips
-            
-            // Determinar posición en el ciclo
+            uint32_t totalCycleLength = wavesToSkipCurrent + 2;
             uint32_t cyclePosition = waveCount[dev] % totalCycleLength;
-            
-            // Disparar solo en las primeras 2 posiciones del ciclo
             shouldFire = (cyclePosition < 2);
-            
-            // Actualizar contador de pulsos consecutivos para debug
-            if (shouldFire) {
-                consecutivePulses[dev]++;
-            } else {
-                consecutivePulses[dev] = 0;
-            }
-            
-            // Incrementar contador de ondas
-            waveCount[dev]++;
         }
         
-        // 4. PROGRAMAR TIMER SOLO SI DEBE DISPARAR
+        waveCount[dev]++;
+        
+        // 4. PROGRAMAR DISPARO (IGUAL QUE ANTES)
         if (shouldFire && scrDelayUs < ABSOLUTE_MAX_DELAY) {
             esp_timer_start_once(fireTimers[dev], scrDelayUs);
-            
-            // Debug del patrón real
-            static uint32_t lastPatternDebug[3] = {0, 0, 0};
-            if (micros() - lastPatternDebug[dev] > 3000000 && wavesToSkipCurrent > 0) { // Cada 3 segundos
-                Serial.printf("[FASE%c] Patrón: %d pulsos → saltar %lu ondas | Ciclo: %lu\n", 
-                             'A' + dev, consecutivePulses[dev], wavesToSkipCurrent, wavesToSkipCurrent + 2);
-                lastPatternDebug[dev] = micros();
-            }
         }
         
-        // Reset preventivo
         if (waveCount[dev] > 1000000) {
             waveCount[dev] = 0;
-            consecutivePulses[dev] = 0;
         }
     }
 }
+
 // ================== WATCHDOG CONFIGURATION ==================
 void enableWatchdog() {
     esp_task_wdt_init(30, false); // ⚡ Volver a 30 segundos (ahora será estable)
@@ -240,8 +231,8 @@ void i2cManagerTask(void *pvParameters) {
     
     for (;;) {
         esp_task_wdt_reset();
-        
-        if (xQueueReceive(i2cQueue, &req, pdMS_TO_TICKS(100)) == pdTRUE) {
+            
+        if (xQueueReceive(i2cQueue, &req, pdMS_TO_TICKS(200)) == pdTRUE) {
             esp_task_wdt_reset();
             
             switch (req.device) {
@@ -376,23 +367,24 @@ void digitalInputTask(void* parameter) {
 // ================== CONTROL POTENCIÓMETRO ==================
 uint32_t calculateWavesToSkip(int potPercentage) {
     // Tabla progresiva de skipeo de ondas
+    return 0;
     if (potPercentage == 0) return 50;      // 0% → saltar 50 ondas (mínima corriente)
-    else if (potPercentage <= 5) return 4; // 1-5% → saltar 20 ondas
-    else if (potPercentage <= 10) return 4;// 6-10% → saltar 15 ondas
-    else if (potPercentage <= 15) return 6;// 11-15% → saltar 12 ondas
-    else if (potPercentage <= 20) return 6;// 16-20% → saltar 10 ondas
-    else if (potPercentage <= 25) return 8; // 21-25% → saltar 8 ondas
-    else if (potPercentage <= 30) return 8; // 26-30% → saltar 6 ondas
-    else if (potPercentage <= 35) return 10; // 31-35% → saltar 5 ondas
-    else if (potPercentage <= 40) return 10; // 36-40% → saltar 4 ondas
-    else if (potPercentage <= 45) return 12; // 41-45% → saltar 3 ondas
-    else if (potPercentage <= 50) return 12; // 46-50% → saltar 2 ondas
-    else if (potPercentage <= 60) return 14; // 51-60% → saltar 1 onda
+    else if (potPercentage <= 5) return 2; // 1-5% → saltar 20 ondas
+    else if (potPercentage <= 10) return 2;// 6-10% → saltar 15 ondas
+    else if (potPercentage <= 15) return 2;// 11-15% → saltar 12 ondas
+    else if (potPercentage <= 20) return 2;// 16-20% → saltar 10 ondas
+    else if (potPercentage <= 25) return 2; // 21-25% → saltar 8 ondas
+    else if (potPercentage <= 30) return 2; // 26-30% → saltar 6 ondas
+    else if (potPercentage <= 35) return 2; // 31-35% → saltar 5 ondas
+    else if (potPercentage <= 40) return 2; // 36-40% → saltar 4 ondas
+    else if (potPercentage <= 45) return 2; // 41-45% → saltar 3 ondas
+    else if (potPercentage <= 50) return 2; // 46-50% → saltar 2 ondas
+    else if (potPercentage <= 60) return 2; // 51-60% → saltar 1 onda
     else return 0;                          // 61-100% → no saltar ondas
 }
 
 void updateWaveBasedControl() {
-    const float POT_MIN_V = 2.00;  // ⚡ Mínimo útil
+    const float POT_MIN_V = 2.30;  // ⚡ Mínimo útil
     const float POT_MAX_V = 4.00;  // ⚡ Máximo útil
     const float alpha = 0.6;
 
@@ -493,20 +485,26 @@ void setup() {
         zcQueues[i] = xQueueCreate(5, sizeof(uint8_t)); // ⚡ Cola más pequeña (ya no es crítica)
         currentPhaseDelays[i] = 8300;
         
-        // ⚡ CONFIGURAR TIMERS DE HARDWARE
-        esp_timer_create_args_t timerArgs = {
-            .callback = &fireTimerCallback,      // ⚡ NUEVO CALLBACK
+        // Timer para disparo
+        esp_timer_create_args_t fireTimerArgs = {
+            .callback = &fireTimerCallback,
             .arg = (void*)(intptr_t)i,
-            .dispatch_method = ESP_TIMER_TASK,
+            .dispatch_method = ESP_TIMER_ISR,
             .name = "SCR_Fire_Timer",
             .skip_unhandled_events = true
         };
+        esp_timer_create(&fireTimerArgs, &fireTimers[i]);
         
-        if (esp_timer_create(&timerArgs, &fireTimers[i]) == ESP_OK) {
-            Serial.printf("✅ Timer HW Fase %c configurado\n", 'A' + i);
-        } else {
-            Serial.printf("❌ Error creando timer Fase %c\n", 'A' + i);
-        }
+        // ⚡ Timer para apagado retardado
+        esp_timer_create_args_t turnOffTimerArgs = {
+            .callback = &turnOffTimerCallback,
+            .arg = (void*)(intptr_t)i,
+            .dispatch_method = ESP_TIMER_ISR,
+            .name = "SCR_TurnOff_Timer", 
+            .skip_unhandled_events = true
+        };
+        esp_timer_create(&turnOffTimerArgs, &turnOffTimers[i]);
+        
     }
 
     sensores.begin();

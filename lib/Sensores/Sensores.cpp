@@ -36,8 +36,8 @@ bool Sensores::begin() {
         Serial.println("❌ No se pudo inicializar ADS1115 (0x49)");
         success = false;
     } else {
-        adsHigh.setGain(GAIN_ONE);  // ±4.096V
-        adsHigh.setDataRate(RATE_ADS1115_860SPS); // ⚡ MÁXIMA VELOCIDAD
+        adsHigh.setGain(GAIN_SIXTEEN);  // ±0.256 V
+        adsHigh.setDataRate(RATE_ADS1115_128SPS); // ⚡ MÁXIMA VELOCIDAD
         Serial.println("✅ ADS1115 (0x49) inicializado");
     }
     
@@ -49,62 +49,77 @@ bool Sensores::begin() {
 
 // ⚡ LECTURA ULTRA RÁPIDA - SOLO LECTURAS CRÍTICAS
 bool Sensores::readAllSensors(float* results, uint8_t numChannels) {
-    static uint32_t lastReadTime = 0;
-    static uint32_t readCounter = 0;
-    
-    // Solo leer cada 200ms para reducir carga (opcional)
-    if (millis() - lastReadTime < 200 && readCounter > 0) {
-        return true; // Usar valores anteriores
-    }
-    
-    if (!takeI2CMutex(15, "ADS_READ_ALL")) {   // ⚡ Timeout MUY corto
-        return false; // No log, just fail silently
+    if (!takeI2CMutex(200, "ADS_READ_ALL")) { 
+        if (verboseLog) Serial.println("❌ No se pudo tomar mutex en readAllSensors");
+        return false;
     }
     
     uint32_t startTime = micros();
     bool success = true;
 
-    // ⚡ LECTURA DIRECTA SIN VERIFICACIONES EXTRA
-    try {
-        // 1. Potenciómetro (más importante)
-        int16_t potRaw = adsLow.readADC_SingleEnded(POT_CHANNEL);
-        voltage = (potRaw * 0.1875) / 1000.0;
-        potPercentageLocal = constrain((voltage / 5.0) * 100.0, 0, 100);
-        ::potPercentage = (uint32_t)potPercentageLocal;
+    // 1. LEER POTENCIÓMETRO (canal single-ended en ADS 0x48)
+    int16_t potRaw = adsLow.readADC_SingleEnded(POT_CHANNEL);
+    voltage = (potRaw * 0.1875) / 1000.0; // Convertir a voltios
+    potPercentageLocal = constrain((voltage / 5.0) * 100.0, 0, 100);
+    ::potPercentage = (uint32_t)potPercentageLocal;
 
-        // 2. Corrientes fase A y B (lectura rápida)
-        for (int dev = 0; dev < 2; dev++) {
-            int16_t raw = adsLow.readADC_SingleEnded(CURRENT_CHANNELS[dev]);
-            float vSense = raw * 0.1875 / 1000.0;
-            current[dev] = vSense * 100.0f; // Conversión simplificada
-            if (fabs(current[dev]) < 2.0f) current[dev] = 0.0f;
-        }
-
-        // 3. Corriente fase C (diferencial) - SOLO si es crítica
-        if (readCounter % 2 == 0) { // Leer cada 2 ciclos para reducir carga
-            int16_t raw = adsHigh.readADC_Differential_0_1();
-            float vSense = raw * 7.8125e-6f; // LSB para GAIN_ONE
-            
-            static float currentEMA = 0.0f;
-            const float alpha = 0.3f;
-            float ampsInstant = vSense * 200.0f;
-            currentEMA = (1 - alpha) * currentEMA + alpha * ampsInstant;
-            
-            if (fabs(currentEMA) < 10.0f) currentEMA = 0.0f;
-            current[2] = currentEMA;
-        }
-        
-    } catch (...) {
-        success = false;
+    // 2. ⚡ LEER CORRIENTE - CANAL DIFERENCIAL 0-1 EN ADS 0x49
+    int16_t currentRaw = adsHigh.readADC_Differential_0_1();
+    if (abs(currentRaw) > 6400) {
+        Serial.printf("⚠️ Lectura fuera de rango: %d\n", currentRaw);
+        currentRaw = constrain(currentRaw, -6400, 6400);   // O bien descarta: raw = prevRaw;
     }
     
+    // Conversión a amperios
+    // ADS1115 con GAIN_ONE: ±0.256V, LSB = 125µV
+    constexpr float LSB = 7.8125e-6f; // voltios por bit
+    float voltageDiff = currentRaw * LSB;
+    
+    // ⚡ CALIBRAR ESTE FACTOR SEGÚN TU SENSOR DE CORRIENTE
+    // Ejemplo: Si usas sensor de 30A/1V, factor = 30
+    // Ejemplo: Si usas shunt, calcular según resistencia
+    const float CURRENT_SENSITIVITY = 20000.00000f;  // 20 A/mV = 20000 A/V
+    float currentInstant = voltageDiff* CURRENT_SENSITIVITY;
+    
+    // Aplicar filtro para suavizar lectura
+    static float currentFiltered[NUM_DEVICES] = {0, 0, 0};
+    const float alpha = 0.5; // Factor de filtrado
+    
+    currentFiltered[2] = (1 - alpha) * currentFiltered[2] + alpha * currentInstant;
+    
+    // Eliminar ruido cerca de cero
+    if (fabs(currentFiltered[2]) < 0.5) {
+        currentFiltered[2] = 0.0;
+    }
+    
+    // Asignar a variable global (fase C)
+    current[2] = currentFiltered[2];
+    // Asignar a variable global (fase C)
+
+    // 🔹 Mostrar resultado en monitor serie
+    Serial.printf("ADC= %d | ΔV= %.6f V | Corriente= %.2f A\n", 
+                currentRaw, voltageDiff, current[2]);
+
+    // 3. LEER OTRAS CORRIENTES SI ES NECESARIO
+    // (Mantener las lecturas existentes para fases A y B si las tienes)
+    for (int dev = 0; dev < 2; dev++) {
+        // Tus lecturas existentes para fases A y B
+        int16_t raw = adsLow.readADC_SingleEnded(CURRENT_CHANNELS[dev]);
+        float vSense = raw * 0.1875 / 1000.0;
+        current[dev] = vSense * 100.0f; // Ajustar según tu calibración
+        if (fabs(current[dev]) < 2.0f) current[dev] = 0.0f;
+    }
+
     giveI2CMutex();
     
-    readCounter++;
-    lastReadTime = millis();
+    uint32_t duration = micros() - startTime;
+    if (duration > 5000 && verboseLog) {
+        Serial.printf("[SENSORES] Lectura tomó %luμs\n", duration);
+    }
     
     return success;
 }
+
 
 // 🔄 MANTENER LAS OTRAS FUNCIONES PERO CON TIMEOUTS MÁS CORTOS
 float Sensores::readSingle(Adafruit_ADS1115& ads, uint8_t channel, bool differential, float gain) {
