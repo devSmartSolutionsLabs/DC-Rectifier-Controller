@@ -489,7 +489,7 @@ void setup() {
         esp_timer_create_args_t fireTimerArgs = {
             .callback = &fireTimerCallback,
             .arg = (void*)(intptr_t)i,
-            .dispatch_method = ESP_TIMER_ISR,
+            .dispatch_method = ESP_TIMER_TASK,
             .name = "SCR_Fire_Timer",
             .skip_unhandled_events = true
         };
@@ -499,7 +499,7 @@ void setup() {
         esp_timer_create_args_t turnOffTimerArgs = {
             .callback = &turnOffTimerCallback,
             .arg = (void*)(intptr_t)i,
-            .dispatch_method = ESP_TIMER_ISR,
+            .dispatch_method = ESP_TIMER_TASK,
             .name = "SCR_TurnOff_Timer", 
             .skip_unhandled_events = true
         };
