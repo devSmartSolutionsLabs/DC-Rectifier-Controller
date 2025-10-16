@@ -106,7 +106,7 @@ bool mcp23017_read_register(uint8_t reg, uint8_t *value) {
 }
 
 void init_mcp23017() {
-    // Configurar Puerto A como salidas (A0, A1 para relés)
+    // Configurar Puerto A como salidas (A0, A1, A3 para relés)
     mcp23017_write_register(MCP23017_IODIRA, 0x00); // Todos como salidas
     
     // Configurar Puerto B como entradas (B0, B1 para botones)
@@ -125,17 +125,26 @@ void update_relays() {
     uint8_t relay_state = 0x00;
     
     if (system_enabled) {
-        relay_state |= 0x01; // Encender A0
+        relay_state |= 0x01; // Encender A0 (potencia principal)
     }
     
     if (relay_a1_state) {
-        relay_state |= 0x02; // Encender A1
+        relay_state |= 0x02; // Encender A1 (dirección)
+    }
+    
+    // ⚡ A3 se enciende SOLO cuando system_ready (pulsos habilitados)
+    if (system_ready) {
+        relay_state |= 0x08; // Encender A3 (habilitación física de pulsos)
+        printf(">>> RELE A3 ENCENDIDO - Pulsos habilitados físicamente\n");
+    } else {
+        printf(">>> RELE A3 APAGADO - Pulsos deshabilitados físicamente\n");
     }
     
     mcp23017_write_register(MCP23017_GPIOA, relay_state);
-    printf("Relés actualizados: A0=%s, A1=%s\n", 
+    printf("Relés actualizados: A0=%s, A1=%s, A3=%s\n", 
            system_enabled ? "ON" : "OFF", 
-           relay_a1_state ? "ON" : "OFF");
+           relay_a1_state ? "ON" : "OFF",
+           system_ready ? "ON" : "OFF");
 }
 
 void enable_phase_control(bool enable) {
@@ -195,71 +204,82 @@ void read_buttons() {
         return;
     }
     
-    bool button_b0 = !(port_b_value & 0x01); // B0 activo en bajo (por pull-up)
-    bool button_b1 = !(port_b_value & 0x02); // B1 activo en bajo (por pull-up)
+    bool button_b0 = !(port_b_value & 0x01);
+    bool button_b1 = !(port_b_value & 0x02);
     
-    uint32_t current_time = esp_timer_get_time() / 1000; // Tiempo en ms
+    uint32_t current_time = esp_timer_get_time() / 1000;
     
-    // Lógica del botón START (B0) - Modo "mantener para activar"
+    // Lógica del botón START (B0)
     if (button_b0 && !button_start_pressed) {
-        // Botón presionado por primera vez
         button_start_pressed = true;
         button_start_press_time = current_time;
         printf("Boton START presionado - contando 3 segundos...\n");
     } 
     else if (button_b0 && button_start_pressed) {
-        // Botón mantenido presionado - Activar después de 3 segundos
         uint32_t pressed_time = current_time - button_start_press_time;
         
         if (pressed_time >= 3000 && !system_enabled) {
-            // Activar sistema después de 3 segundos
             system_enabled = true;
-            system_ready = false; // Aún no está listo para enviar pulsos
-            system_activation_time = current_time; // Guardar tiempo de activación
+            system_ready = false;
+            system_activation_time = current_time;
             printf(">>> Sistema ACTIVADO (manteniendo START)\n");
             printf(">>> Esperando 2 segundos para habilitar pulsos...\n");
-            update_relays();
+            update_relays(); // Actualizar relés (A0 ON, A3 OFF por ahora)
         }
         else if (pressed_time < 3000) {
-            // Mostrar cuenta regresiva
             if (pressed_time % 1000 == 0) {
                 printf("Manteniendo START... %lu segundos\n", (3000 - pressed_time) / 1000);
             }
         }
     }
     else if (!button_b0 && button_start_pressed) {
-        // Botón liberado - Desactivar sistema
+        // ⚡ APAGADO SEGURO: Primero deshabilitar pulsos (A3), luego potencia (A0)
         button_start_pressed = false;
         
         if (system_enabled) {
-            system_enabled = false;
+            printf("=== INICIANDO APAGADO SEGURO ===\n");
+            
+            // 1. DESHABILITAR PULSOS INMEDIATAMENTE (A3 OFF)
             system_ready = false;
-            // Deshabilitar todas las fases al desactivar el sistema
+            
+            // 2. Deshabilitar todas las fases de software
             for (int i = 0; i < NUM_PHASES; i++) {
                 phases[i].enabled = false;
+                gpio_set_level(phases[i].output_pin, 0); // Apagar SCRs
             }
+            
+            printf(">>> Pulsos DESHABILITADOS - A3 OFF, SCRs apagados\n");
+            
+            // 3. Actualizar relés inmediatamente (A3 se apaga aquí)
             update_relays();
-            printf("<<< Sistema DESACTIVADO (START liberado)\n");
+            
+            // 4. DESHABILITAR SISTEMA COMPLETO después de deshabilitar pulsos
+            system_enabled = false;
+            
+            printf("<<< Sistema DESACTIVADO (apagado seguro completado)\n");
         } else {
             printf("Boton START liberado (sin activar sistema)\n");
         }
     }
     
-    // Verificar si han pasado 2 segundos desde la activación del sistema
+    // ⚡ VERIFICAR SI system_ready CAMBIÓ Y ACTUALIZAR RELÉS
+    static bool last_system_ready = false;
     if (system_enabled && !system_ready) {
-        uint32_t current_time = esp_timer_get_time() / 1000;
-        if (current_time - system_activation_time >= 2000) {
+        uint32_t current_time_check = esp_timer_get_time() / 1000;
+        if (current_time_check - system_activation_time >= 2000) {
             system_ready = true;
             printf(">>> SISTEMA LISTO - Pulsos habilitados después de 2 segundos\n");
-        } else {
-            uint32_t remaining_time = 2000 - (current_time - system_activation_time);
-            if (remaining_time % 1000 == 0) {
-                printf("Esperando... %lu segundos restantes\n", remaining_time / 1000);
-            }
+            update_relays(); // ⚡ ACTUALIZAR RELÉS PARA ENCENDER A3
         }
     }
     
-    // Lógica del botón DIRECCION (B1) - solo si el sistema está activado
+    // ⚡ ACTUALIZAR RELÉS SI system_ready CAMBIÓ
+    if (system_ready != last_system_ready) {
+        update_relays();
+        last_system_ready = system_ready;
+    }
+    
+    // Lógica del botón DIRECCION (B1)
     if (system_enabled) {
         bool new_relay_a1_state = !button_b1;
         if (new_relay_a1_state != relay_a1_state) {
@@ -267,7 +287,6 @@ void read_buttons() {
             update_relays();
         }
     } else {
-        // Si el sistema está desactivado, asegurar que A1 esté apagado
         if (relay_a1_state) {
             relay_a1_state = false;
             update_relays();
