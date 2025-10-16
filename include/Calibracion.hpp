@@ -1,8 +1,6 @@
 #ifndef CALIBRACION_HPP
 #define CALIBRACION_HPP
 
-#include <EEPROM.h>
-
 // --- Configuración EEPROM ---
 #define MAX_POINTS 10
 #define MAX_SINGLE_CHANNELS 4
