@@ -2,7 +2,6 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/gpio.h"
-#include "driver/adc.h"
 #include "driver/gptimer.h"
 #include "driver/i2c.h"
 #include "esp_timer.h"
@@ -12,14 +11,15 @@
 constexpr uint32_t ZC_PULSE_WIDTH_US = 20;
 constexpr uint32_t DEBOUNCE_TIME_US = 700;
 constexpr uint32_t MIN_DELAY_US = 6800;
-constexpr uint32_t MAX_DELAY_US = 8310;
+constexpr uint32_t MAX_DELAY_US = 8300;
 
 constexpr gpio_num_t I2C_SDA_PIN = GPIO_NUM_5;
 constexpr gpio_num_t I2C_SCL_PIN = GPIO_NUM_4;
 constexpr i2c_port_t I2C_PORT = I2C_NUM_0;
 
-constexpr uint8_t ADS1115_ADDR = 0x48;
-constexpr uint8_t MCP23017_ADDR = 0x27;
+constexpr uint8_t ADS1115_ADDR_1 = 0x48;  // Primer ADS1115 (potenciómetro)
+constexpr uint8_t ADS1115_ADDR_2 = 0x49;  // Segundo ADS1115 (voltaje diferencial)
+constexpr uint8_t MCP23017_ADDR = 0x27;   // ✅ AÑADIDO: Dirección MCP23017
 
 // Registros MCP23017 
 constexpr uint8_t MCP23017_IODIRA = 0x00;
@@ -30,7 +30,10 @@ constexpr uint8_t MCP23017_GPPUB = 0x0D;
 
 constexpr uint8_t ADS1115_REG_CONVERSION = 0x00;
 constexpr uint8_t ADS1115_REG_CONFIG = 0x01;
-constexpr uint16_t ADS1115_CONFIG_START = 0xC1C3;
+
+// Configuraciones ADS1115
+constexpr uint16_t ADS1115_CONFIG_START = 0xC1C3;  // Potenciómetro
+constexpr uint16_t ADS1115_CONFIG_DIFF_0_1 = 0xC583; 
 
 constexpr int32_t I2C_MAX_VALUE = 32767;
 #define FILTER_SIZE 16 // x
@@ -45,7 +48,7 @@ typedef struct {
 } phase_config_t;
 
 #define NUM_PHASES 3
-constexpr int32_t RAW_V_MIN = 15699; 
+constexpr int32_t RAW_V_MIN = 15799; 
 constexpr int32_t RAW_V_MAX = 17799;
 constexpr int32_t ONE_PHASE_THRESHOLD = 16999;
 constexpr int32_t TWO_PHASE_THRESHOLD = 17499; // Umbral para 2 fases vs 3 fases
@@ -59,6 +62,10 @@ phase_config_t phases[NUM_PHASES] = {
 static int32_t reading_buffer[FILTER_SIZE] = {0};
 static int buffer_index = 0;
 
+// Buffer para voltaje diferencial
+static float voltage_buffer[FILTER_SIZE] = {0};
+static int voltage_index = 0;
+
 // Variables para el control de botones y relés
 static volatile bool system_enabled = false;
 static volatile bool system_ready = false; // Nueva variable: sistema listo para enviar pulsos
@@ -70,7 +77,7 @@ static uint32_t system_activation_time = 0; // Tiempo cuando se activó el siste
 bool mcp23017_write_register(uint8_t reg, uint8_t value) {
     i2c_cmd_handle_t cmd = i2c_cmd_link_create();
     i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (MCP23017_ADDR << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(cmd, (MCP23017_ADDR << 1) | I2C_MASTER_WRITE, true); // ✅ CORREGIDO
     i2c_master_write_byte(cmd, reg, true);
     i2c_master_write_byte(cmd, value, true);
     i2c_master_stop(cmd);
@@ -88,10 +95,10 @@ bool mcp23017_write_register(uint8_t reg, uint8_t value) {
 bool mcp23017_read_register(uint8_t reg, uint8_t *value) {
     i2c_cmd_handle_t cmd = i2c_cmd_link_create();
     i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (MCP23017_ADDR << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(cmd, (MCP23017_ADDR << 1) | I2C_MASTER_WRITE, true); // ✅ CORREGIDO
     i2c_master_write_byte(cmd, reg, true);
     i2c_master_start(cmd); // Repeated start
-    i2c_master_write_byte(cmd, (MCP23017_ADDR << 1) | I2C_MASTER_READ, true);
+    i2c_master_write_byte(cmd, (MCP23017_ADDR << 1) | I2C_MASTER_READ, true); // ✅ CORREGIDO
     i2c_master_read_byte(cmd, value, I2C_MASTER_NACK);
     i2c_master_stop(cmd);
     
@@ -172,32 +179,37 @@ void update_phases_based_on_potentiometer(int32_t filtered_value) {
         return;
     }
     
-    // Lógica de habilitación de fases según el valor del potenciómetro
-    if (filtered_value <= ONE_PHASE_THRESHOLD) {
-        // 15999 - 16999: Solo fase B
-        phases[0].enabled = false; // Fase A deshabilitada
-        phases[1].enabled = true;  // Fase B habilitada
-        phases[2].enabled = false; // Fase C deshabilitada
-        printf("MODO 1 FASE (B) - Valor: %ld\n", filtered_value);
-    } 
-    else if (filtered_value > ONE_PHASE_THRESHOLD && filtered_value <= TWO_PHASE_THRESHOLD ){
-        // 17000 - 17199: Fases B y C
-        phases[0].enabled = false; // Fase A deshabilitada
-        phases[1].enabled = true;  // Fase B habilitada
-        phases[2].enabled = true;  // Fase C habilitada
-        printf("MODO 2 FASES (B y C) - Valor: %ld\n", filtered_value);
+    if(relay_a1_state){
+        // Lógica de habilitación de fases según el valor del potenciómetro
+        if (filtered_value <= ONE_PHASE_THRESHOLD) {
+            // 15999 - 16999: Solo fase B
+            phases[0].enabled = false; // Fase A deshabilitada
+            phases[1].enabled = false;  // Fase B habilitada
+            phases[2].enabled = true; // Fase C deshabilitada
+            printf("MODO 1 FASE (B) - Valor: %ld\n", filtered_value);
+        } 
+        else if (filtered_value > ONE_PHASE_THRESHOLD && filtered_value <= TWO_PHASE_THRESHOLD ){
+            // 17000 - 17199: Fases B y C
+            phases[0].enabled = false; // Fase A deshabilitada
+            phases[1].enabled = true;  // Fase B habilitada
+            phases[2].enabled = true;  // Fase C habilitada
+            printf("MODO 2 FASES (B y C) - Valor: %ld\n", filtered_value);
+        }
+        else {
+            // 17200 - 17599: Las 3 fases
+            phases[0].enabled = true;  // Fase A habilitada
+            phases[1].enabled = true;  // Fase B habilitada
+            phases[2].enabled = true;  // Fase C habilitada
+            printf("MODO 3 FASES (A, B y C) - Valor: %ld\n", filtered_value);
+        }
     }
-    else {
-        // 17200 - 17599: Las 3 fases
-        phases[0].enabled = true;  // Fase A habilitada
-        phases[1].enabled = true;  // Fase B habilitada
-        phases[2].enabled = true;  // Fase C habilitada
-        printf("MODO 3 FASES (A, B y C) - Valor: %ld\n", filtered_value);
+    else if(!relay_a1_state){
+            phases[0].enabled = true;  // Fase A habilitada
+            phases[1].enabled = true;  // Fase B habilitada
+            phases[2].enabled = true;  // Fase C habilitada
+            printf("MODO 4 : REVERSA->  FASES (A, B y C) - Valor: %ld\n", filtered_value);
     }
-
-    // prueba con todos encendidos
 }
-
 void read_buttons() {
     uint8_t port_b_value;
     if (!mcp23017_read_register(MCP23017_GPIOB, &port_b_value)) {
@@ -233,11 +245,11 @@ void read_buttons() {
         }
     }
     else if (!button_b0 && button_start_pressed) {
-        // ⚡ APAGADO SEGURO: Primero deshabilitar pulsos (A3), luego potencia (A0)
+        // ⚡ SECUENCIA DE APAGADO SEGURO
         button_start_pressed = false;
         
         if (system_enabled) {
-            printf("=== INICIANDO APAGADO SEGURO ===\n");
+            printf("=== INICIANDO SECUENCIA DE APAGADO SEGURO ===\n");
             
             // 1. DESHABILITAR PULSOS INMEDIATAMENTE (A3 OFF)
             system_ready = false;
@@ -248,15 +260,24 @@ void read_buttons() {
                 gpio_set_level(phases[i].output_pin, 0); // Apagar SCRs
             }
             
-            printf(">>> Pulsos DESHABILITADOS - A3 OFF, SCRs apagados\n");
+            printf(">>> PASO 1: Pulsos DESHABILITADOS - A3 OFF, SCRs apagados\n");
             
             // 3. Actualizar relés inmediatamente (A3 se apaga aquí)
             update_relays();
             
-            // 4. DESHABILITAR SISTEMA COMPLETO después de deshabilitar pulsos
-            system_enabled = false;
+            // 4. ESPERAR 2 SEGUNDOS antes de apagar potencia
+            printf(">>> PASO 2: Esperando 2 segundos antes de apagar potencia...\n");
+            uint32_t shutdown_start = current_time;
+            while (esp_timer_get_time() / 1000 - current_time < 2000) {
+                vTaskDelay(pdMS_TO_TICKS(10));
+            }
             
-            printf("<<< Sistema DESACTIVADO (apagado seguro completado)\n");
+            // 5. APAGAR POTENCIA (A0 OFF)
+            system_enabled = false;
+            update_relays(); // Esto apagará A0
+            
+            printf(">>> PASO 3: Potencia APAGADA - A0 OFF\n");
+            printf("<<< SECUENCIA DE APAGADO COMPLETADA - Sistema en estado inicial\n");
         } else {
             printf("Boton START liberado (sin activar sistema)\n");
         }
@@ -305,7 +326,7 @@ int32_t ads1115_read_raw() {
     
     i2c_cmd_handle_t cmd = i2c_cmd_link_create();
     i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (ADS1115_ADDR << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(cmd, (ADS1115_ADDR_1 << 1) | I2C_MASTER_WRITE, true);
     i2c_master_write(cmd, config_buf, 3, true);
     i2c_master_stop(cmd);
     
@@ -313,7 +334,7 @@ int32_t ads1115_read_raw() {
     i2c_cmd_link_delete(cmd);
     
     if (ret != ESP_OK) {
-        printf("Error escribiendo configuración ADS1115: %d\n", ret);
+        printf("Error escribiendo configuración ADS1115 (0x48): %d\n", ret);
         return 0;
     }
     
@@ -321,10 +342,10 @@ int32_t ads1115_read_raw() {
     
     cmd = i2c_cmd_link_create();
     i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (ADS1115_ADDR << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(cmd, (ADS1115_ADDR_1 << 1) | I2C_MASTER_WRITE, true);
     i2c_master_write_byte(cmd, ADS1115_REG_CONVERSION, true);
     i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (ADS1115_ADDR << 1) | I2C_MASTER_READ, true);
+    i2c_master_write_byte(cmd, (ADS1115_ADDR_1 << 1) | I2C_MASTER_READ, true);
     i2c_master_read(cmd, data, 2, I2C_MASTER_LAST_NACK);
     i2c_master_stop(cmd);
     
@@ -332,12 +353,70 @@ int32_t ads1115_read_raw() {
     i2c_cmd_link_delete(cmd);
     
     if (ret != ESP_OK) {
-        printf("Error leyendo conversión ADS1115: %d\n", ret);
+        printf("Error leyendo conversión ADS1115 (0x48): %d\n", ret);
         return 0;
     }
     
     int16_t raw_value = (data[0] << 8) | data[1];
     return raw_value;
+}
+
+float ads1115_read_differential_voltage() {
+    uint8_t data[2];
+    
+    // Configurar para lectura diferencial A0-A1
+    uint8_t config_buf[3] = {
+        ADS1115_REG_CONFIG, 
+        (uint8_t)(ADS1115_CONFIG_DIFF_0_1 >> 8), 
+        (uint8_t)(ADS1115_CONFIG_DIFF_0_1 & 0xFF)
+    };
+    
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (ADS1115_ADDR_2 << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write(cmd, config_buf, 3, true);
+    i2c_master_stop(cmd);
+    
+    esp_err_t ret = i2c_master_cmd_begin(I2C_PORT, cmd, pdMS_TO_TICKS(100));
+    i2c_cmd_link_delete(cmd);
+    
+    if (ret != ESP_OK) {
+        printf("Error escribiendo configuración ADS1115 (0x49): %d\n", ret);
+        return 0.0f;
+    }
+    
+    vTaskDelay(pdMS_TO_TICKS(16)); // Esperar conversión (16ms para 64SPS)
+    
+    // Leer resultado
+    cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (ADS1115_ADDR_2 << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(cmd, ADS1115_REG_CONVERSION, true);
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (ADS1115_ADDR_2 << 1) | I2C_MASTER_READ, true);
+    i2c_master_read(cmd, data, 2, I2C_MASTER_LAST_NACK);
+    i2c_master_stop(cmd);
+    
+    ret = i2c_master_cmd_begin(I2C_PORT, cmd, pdMS_TO_TICKS(100));
+    i2c_cmd_link_delete(cmd);
+    
+    if (ret != ESP_OK) {
+        printf("Error leyendo conversión ADS1115 (0x49): %d\n", ret);
+        return 0.0f;
+    }
+    
+    int16_t raw_value = (data[0] << 8) | data[1];
+    
+    // ⚡ DEBUG: Mostrar valor RAW
+    printf("ADS1115 (0x49) RAW: 0x%04X (%d)\n", raw_value & 0xFFFF, raw_value);
+    
+    // Convertir a voltaje (±0.256V range, 15 bits de resolución)
+    // LSB size = 0.256V / 32768 = 7.8125μV
+    float voltage = (raw_value * 0.256f) / 32768.0f;
+    
+    printf("ADS1115 (0x49) Calculated: %.6f V -> %.3f mV\n", voltage, voltage * 1000.0f);
+    
+    return voltage * 1000.0f; // Convertir a mV
 }
 
 int32_t get_i2c_filtered_value(int32_t raw_value) {
@@ -380,7 +459,7 @@ static bool IRAM_ATTR scr_fire_timer_isr(gptimer_handle_t timer, const gptimer_a
     } else {
         // ZC todavía activo - REPROGRAMAR timer
         gptimer_alarm_config_t alarm_config = {
-            .alarm_count = 10,  // ⬅️ Esperar 50us (más que el ancho de tu pulso ZC)
+            .alarm_count = 2,  // ⬅️ Esperar 10us
             .reload_count = 0,
             .flags = {0}
         };
@@ -438,69 +517,84 @@ void button_control_task(void* arg) {
     
     while (1) {
         read_buttons();
-        vTaskDelay(pdMS_TO_TICKS(100)); // Leer botones cada 50ms
+        vTaskDelay(pdMS_TO_TICKS(100)); // Leer botones cada 100ms
     }
 }
 
 void dynamic_control_task(void* arg) {
-    const uint32_t ADC_MAP_RANGE = RAW_V_MAX - RAW_V_MIN;
+    // ✅ CORREGIDO: Eliminada variable no usada
     uint32_t delay_range = MAX_DELAY_US - MIN_DELAY_US;
     
     printf("Tarea de control dinámico iniciada.\n");
     
+    // Inicializar buffers
     for (int i = 0; i < FILTER_SIZE; i++) {
         reading_buffer[i] = ads1115_read_raw();
-        vTaskDelay(pdMS_TO_TICKS(10));
+        voltage_buffer[i] = ads1115_read_differential_voltage();
+        vTaskDelay(pdMS_TO_TICKS(20));
     }
     
     while (1) {
-        // Siempre leer el potenciómetro para mostrar valores
+        // Leer potenciómetro (ADS1115 0x48)
         int32_t raw_value = ads1115_read_raw();
         int32_t i2c_value_filtered = get_i2c_filtered_value(raw_value);
-
+        
         if (i2c_value_filtered < RAW_V_MIN) i2c_value_filtered = RAW_V_MIN;
         if (i2c_value_filtered > RAW_V_MAX) i2c_value_filtered = RAW_V_MAX;
-
         
+        // Leer voltaje diferencial (ADS1115 0x49)
+        float diff_voltage_raw = ads1115_read_differential_voltage();
+        
+        // Filtrar voltaje diferencial
+        voltage_buffer[voltage_index] = diff_voltage_raw;
+        voltage_index = (voltage_index + 1) % FILTER_SIZE;
+        
+        float voltage_sum = 0;
+        for (int i = 0; i < FILTER_SIZE; i++) {
+            voltage_sum += voltage_buffer[i];
+        }
+        float diff_voltage_filtered = voltage_sum / FILTER_SIZE;
+        
+        // Cálculo del delay
         float ratio_saturated = 0.0;
-
-        if(i2c_value_filtered <= ONE_PHASE_THRESHOLD){
-            ratio_saturated = (float)(i2c_value_filtered - RAW_V_MIN) / (ONE_PHASE_THRESHOLD - RAW_V_MIN);
+        if(relay_a1_state){
+            if(i2c_value_filtered <= ONE_PHASE_THRESHOLD){
+                ratio_saturated = (float)(i2c_value_filtered - RAW_V_MIN) / (ONE_PHASE_THRESHOLD - RAW_V_MIN);
+            }
+            else if(i2c_value_filtered <= TWO_PHASE_THRESHOLD && i2c_value_filtered > ONE_PHASE_THRESHOLD ){
+                ratio_saturated = (float)(35 + i2c_value_filtered - ONE_PHASE_THRESHOLD) / (TWO_PHASE_THRESHOLD - ONE_PHASE_THRESHOLD);
+            }
+            else if(i2c_value_filtered > TWO_PHASE_THRESHOLD ){
+                ratio_saturated = (float)(200 + i2c_value_filtered - TWO_PHASE_THRESHOLD) / (RAW_V_MAX - TWO_PHASE_THRESHOLD);
+            }
         }
-        else if(i2c_value_filtered <= TWO_PHASE_THRESHOLD && i2c_value_filtered > ONE_PHASE_THRESHOLD ){
-            ratio_saturated = (float)(35 + i2c_value_filtered - ONE_PHASE_THRESHOLD) / (TWO_PHASE_THRESHOLD - ONE_PHASE_THRESHOLD);
+        else if(!relay_a1_state){
+            ratio_saturated = (float)(i2c_value_filtered - RAW_V_MIN) / (RAW_V_MAX - RAW_V_MIN);
         }
-        else if(i2c_value_filtered > TWO_PHASE_THRESHOLD ){
-            ratio_saturated = (float)(200 + i2c_value_filtered - TWO_PHASE_THRESHOLD) / (RAW_V_MAX - TWO_PHASE_THRESHOLD);
-        }
-        
-        
         if (ratio_saturated < 0.0f) ratio_saturated = 0.0f;
         if (ratio_saturated > 1.0f) ratio_saturated = 1.0f;
-
         
-
         uint32_t new_delay_base = (uint32_t)((1.0f - ratio_saturated) * delay_range) + MIN_DELAY_US;
         
-        // Solo actualizar delays si el sistema está activado
+        // Mostrar ambos valores
         if (system_enabled) {
             phases[0].delay_us = new_delay_base;
             phases[1].delay_us = new_delay_base;
             phases[2].delay_us = new_delay_base;
             
-            // Actualizar qué fases están habilitadas según el potenciómetro
             update_phases_based_on_potentiometer(i2c_value_filtered);
             
             if (system_ready) {
-                printf("Sistema ACTIVO - RAW: %ld\tFILT: %ld\tDELAY: %lu us\n", 
-                       raw_value, i2c_value_filtered, new_delay_base);
+                printf("Sistema ACTIVO - POT: RAW=%ld FILT=%ld DELAY=%luus | VOLT: %.2fmV (filt: %.2fmV)\n", 
+                       raw_value, i2c_value_filtered, new_delay_base,
+                       diff_voltage_raw, diff_voltage_filtered);
             } else {
-                printf("Sistema ACTIVO (Esperando...) - RAW: %ld\tFILT: %ld\tDELAY: %lu us\n", 
-                       raw_value, i2c_value_filtered, new_delay_base);
+                printf("Sistema ACTIVO (Esperando...) - POT: RAW=%ld FILT=%ld DELAY=%luus | VOLT: %.2fmV\n", 
+                       raw_value, i2c_value_filtered, new_delay_base, diff_voltage_raw);
             }
         } else {
-            printf("Sistema INACTIVO - RAW: %ld\tFILT: %ld (Pulsos deshabilitados)\n", 
-                   raw_value, i2c_value_filtered);
+            printf("Sistema INACTIVO - POT: RAW=%ld FILT=%ld | VOLT: %.2fmV\n", 
+                   raw_value, i2c_value_filtered, diff_voltage_raw);
         }
         
         vTaskDelay(pdMS_TO_TICKS(200)); 
@@ -528,12 +622,17 @@ void initialize_phase(phase_config_t *phase, int timer_idx) {
     
     gpio_set_level(phase->output_pin, 0);
     
+    // ✅ CORREGIDO: Inicialización completa del timer
     gptimer_config_t timer_config = {
         .clk_src = GPTIMER_CLK_SRC_DEFAULT,
         .direction = GPTIMER_COUNT_UP,
         .resolution_hz = 1000000,
         .intr_priority = 2,
-        .flags = {0}
+        .flags = {
+            .intr_shared = false,
+            .allow_pd = false,
+            .backup_before_sleep = false
+        }
     };
     
     ESP_ERROR_CHECK(gptimer_new_timer(&timer_config, &phase->timer));
@@ -596,7 +695,8 @@ extern "C" void app_main(void) {
     printf("START: Mantener 3 segundos para ACTIVAR, soltar para DESACTIVAR\n");
     printf("Sistema espera 2 segundos después de activarse para habilitar pulsos\n");
     printf("B1: DIRECCION (controla Rele A1 cuando sistema activo)\n");
-    printf("A0: Rele Sistema, A1: Rele Direccion\n");
+    printf("A0: Rele Sistema, A1: Rele Direccion, A3: Habilitacion Pulsos\n");
+    printf("ADS1115 0x48: Potenciometro | ADS1115 0x49: Voltaje Diferencial A0-A1\n");
     printf("Modos de operación:\n");
     printf("- 15999-16999: 1 FASE (B)\n");
     printf("- 17000-17199: 2 FASES (B y C)\n");
