@@ -7,6 +7,7 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "freertos/queue.h"
+#include "freertos/event_groups.h"
 
 #include "driver/gpio.h"
 #include "driver/gptimer.h"
@@ -18,11 +19,76 @@
 #include "esp_task_wdt.h"
 #include "esp_log.h"
 
+#include "esp_event.h"
+#include "esp_wifi.h"
+#include "esp_netif.h"
+#include "nvs_flash.h"
+
+#include "http_ota.hpp"
+
+// ===================== Wi-Fi util =====================
+static EventGroupHandle_t s_wifi_eg = nullptr;
+#define WIFI_GOT_IP BIT0
+
+static void ip_event_handler(void*, esp_event_base_t base, int32_t id, void*){
+    if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) xEventGroupSetBits(s_wifi_eg, WIFI_GOT_IP);
+}
+
+static inline bool ok_or_known(esp_err_t e){ return e == ESP_OK || e == ESP_ERR_INVALID_STATE; }
+#define TRY_SKIP_INVALID(x) do { esp_err_t __e = (x); if (!ok_or_known(__e)) { printf(#x " -> err=%d\n", __e); return __e; } } while(0)
+
+static esp_err_t init_nvs(){
+    esp_err_t err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        err = nvs_flash_init();
+    }
+    return err;
+}
+
+static esp_err_t wifi_init_sta_safe(const char* ssid, const char* pass){
+    TRY_SKIP_INVALID(init_nvs());
+    TRY_SKIP_INVALID(esp_netif_init());
+    esp_err_t err = esp_event_loop_create_default();
+    if (!ok_or_known(err)) return err;
+
+    esp_netif_t* netif = esp_netif_create_default_wifi_sta();
+    if (!netif) return ESP_FAIL;
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    TRY_SKIP_INVALID(esp_wifi_init(&cfg));
+
+    wifi_config_t wc = {};
+    strncpy((char*)wc.sta.ssid, ssid, sizeof(wc.sta.ssid));
+    strncpy((char*)wc.sta.password, pass, sizeof(wc.sta.password));
+    wc.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+    wc.sta.sae_pwe_h2e = WPA3_SAE_PWE_BOTH;
+
+    TRY_SKIP_INVALID(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &ip_event_handler, nullptr));
+    TRY_SKIP_INVALID(esp_wifi_set_mode(WIFI_MODE_STA));
+    TRY_SKIP_INVALID(esp_wifi_set_config(WIFI_IF_STA, &wc));
+    TRY_SKIP_INVALID(esp_wifi_start());
+    TRY_SKIP_INVALID(esp_wifi_connect());
+
+    if (!s_wifi_eg) s_wifi_eg = xEventGroupCreate();
+    EventBits_t bits = xEventGroupWaitBits(s_wifi_eg, WIFI_GOT_IP, pdFALSE, pdFALSE, pdMS_TO_TICKS(8000));
+    return (bits & WIFI_GOT_IP) ? ESP_OK : ESP_ERR_TIMEOUT;
+}
+
+// Variables para medir ancho de pulso ZC
+static volatile uint64_t zc_rise_time[3] = {0,0,0};
+static volatile uint32_t zc_pulse_width[3] = {0,0,0};
+
 // ===================== Configuración general =====================
-constexpr uint32_t ZC_PULSE_WIDTH_US = 20;
-constexpr uint32_t DEBOUNCE_TIME_US  = 700;
-constexpr uint32_t MIN_DELAY_US      = 6800;
-constexpr uint32_t MAX_DELAY_US      = 8320;
+constexpr uint32_t ZC_PULSE_WIDTH = 500;
+constexpr uint32_t ZC_PULSE_WIDTH_US = 500;
+constexpr uint32_t DEBOUNCE_TIME_US  = 1000;
+
+constexpr int32_t  WORK_MIN      = 900;
+constexpr uint32_t MIN_DELAY_US  = 7500;
+constexpr uint32_t MAX_DELAY_US  = 8325;
+constexpr int32_t  STEP_COUNTS   = 70;
+constexpr uint32_t US_PER_STEP   = 1;
 
 constexpr gpio_num_t I2C_SDA_PIN = GPIO_NUM_5;
 constexpr gpio_num_t I2C_SCL_PIN = GPIO_NUM_4;
@@ -45,47 +111,26 @@ constexpr uint8_t  ADS1115_REG_CONFIG       = 0x01;
 constexpr uint16_t ADS1115_CONFIG_START     = 0xC1C3;
 constexpr uint16_t ADS1115_CONFIG_DIFF_0_1  = 0xC583;
 
-constexpr int32_t I2C_MAX_VALUE = 32767;
-#define FILTER_SIZE 16
+#define FILTER_SIZE 8
 
 // ===================== Parámetros de pulsación =====================
-static const uint64_t LONG_PRESS_MS  = 3000;
-static const uint64_t MAX_GAP_TOL_MS = 800;   // tolerancia a huecos de lectura
-static const uint64_t FAIL_DT_CAP_MS = 50;    // cap al dt cuando falla I2C
+static const uint64_t STEP1_MS       = 2000;
+static const uint64_t STEP2_MS       = 3000;
+static const uint64_t MAX_GAP_TOL_MS = 800;
+static const uint64_t FAIL_DT_CAP_MS = 50;
 
-// ===================== Logger RAM (única impresión en monitor) =====================
+// ===================== Logger RAM =====================
 enum LogLevel : uint8_t { L_INFO=0, L_WARN=1, L_ERROR=2 };
-
-struct LogMsg {
-    LogLevel level;
-    const char* tag;
-    char text[160];
-};
-
+struct LogMsg { LogLevel level; const char* tag; char text[160]; };
 static QueueHandle_t log_q = nullptr;
 
-#define LOGI(TAG, FMT, ...) do { \
-    if (log_q) { LogMsg _m{L_INFO, TAG, {0}}; \
-        snprintf(_m.text, sizeof(_m.text), FMT, ##__VA_ARGS__); \
-        xQueueSend(log_q, &_m, 0); } \
-} while(0)
-#define LOGW(TAG, FMT, ...) do { \
-    if (log_q) { LogMsg _m{L_WARN, TAG, {0}}; \
-        snprintf(_m.text, sizeof(_m.text), FMT, ##__VA_ARGS__); \
-        xQueueSend(log_q, &_m, 0); } \
-} while(0)
-#define LOGE(TAG, FMT, ...) do { \
-    if (log_q) { LogMsg _m{L_ERROR, TAG, {0}}; \
-        snprintf(_m.text, sizeof(_m.text), FMT, ##__VA_ARGS__); \
-        xQueueSend(log_q, &_m, 0); } \
-} while(0)
+#define LOGI(TAG, FMT, ...) do { if (log_q){ LogMsg _m{L_INFO, TAG, {0}}; snprintf(_m.text, sizeof(_m.text), FMT, ##__VA_ARGS__); xQueueSend(log_q, &_m, 0);} } while(0)
+#define LOGW(TAG, FMT, ...) do { if (log_q){ LogMsg _m{L_WARN, TAG, {0}}; snprintf(_m.text, sizeof(_m.text), FMT, ##__VA_ARGS__); xQueueSend(log_q, &_m, 0);} } while(0)
+#define LOGE(TAG, FMT, ...) do { if (log_q){ LogMsg _m{L_ERROR, TAG, {0}}; snprintf(_m.text, sizeof(_m.text), FMT, ##__VA_ARGS__); xQueueSend(log_q, &_m, 0);} } while(0)
 
-static void logger_task(void*) {
+static void logger_task(void*){
     LogMsg m;
-    for(;;){
-        xQueueReceive(log_q, &m, portMAX_DELAY);
-        // no-op: podrías contar métricas aquí si quieres
-    }
+    for(;;){ xQueueReceive(log_q, &m, portMAX_DELAY); /* hook opcional */ }
 }
 
 // ===================== Sincronización global =====================
@@ -105,18 +150,23 @@ typedef struct {
     gptimer_handle_t timer;
     volatile bool enabled;
     int phase_index;
+    volatile bool pulse_high;
 } phase_config_t;
 
 #define NUM_PHASES 3
-constexpr int32_t RAW_V_MIN            = 15799;
-constexpr int32_t RAW_V_MAX            = 17799;
-constexpr int32_t ONE_PHASE_THRESHOLD  = 16999;
-constexpr int32_t TWO_PHASE_THRESHOLD  = 17499;
+constexpr int32_t RAW_V_MIN            = 700;
+constexpr int32_t RAW_V_MAX            = 20000;
+constexpr int32_t ONE_PHASE_THRESHOLD  = 12000;
+constexpr int32_t TWO_PHASE_THRESHOLD  = 18000;
+
+constexpr uint32_t HALF_PERIOD_US     = 8333;     // 60 Hz
+constexpr uint32_t ZC_MARGIN_US       = 150;
+constexpr uint32_t PULSE_WIDTH_US     = ZC_PULSE_WIDTH_US;
 
 static DRAM_ATTR phase_config_t phases[NUM_PHASES] = {
-    { GPIO_NUM_38, GPIO_NUM_48, MAX_DELAY_US, 0, NULL, false, 0 },
-    { GPIO_NUM_21, GPIO_NUM_47, MAX_DELAY_US, 0, NULL, false, 1 },
-    { GPIO_NUM_14, GPIO_NUM_13, MAX_DELAY_US, 0, NULL, false, 2 }
+    { GPIO_NUM_38, GPIO_NUM_48, MAX_DELAY_US, 0, NULL, false, 0, false },
+    { GPIO_NUM_21, GPIO_NUM_47, MAX_DELAY_US, 0, NULL, false, 1, false },
+    { GPIO_NUM_14, GPIO_NUM_13, MAX_DELAY_US, 0, NULL, false, 2, false }
 };
 
 // Filtros
@@ -125,26 +175,39 @@ static int     buffer_index  = 0;
 static float   voltage_buffer[FILTER_SIZE] = {0};
 static int     voltage_index = 0;
 
-// Estado
-static bool     system_enabled = false;
-static bool     system_ready   = false;
-static bool     relay_a1_state = false;
-static uint64_t button_start_press_time = 0;
-static bool     button_start_pressed    = false;
-static uint64_t system_activation_time  = 0;
+// ======== Estado de relés y sistema (A0/A1/A2/A3) ========
+static bool a0_on = false;
+static bool a1_on = false;
+static bool a2_on = false;
+static bool a3_on = false;
 
-// RMS
+static bool scr_enabled = false;
+
+// Botones y tiempos
+static uint64_t start_hold_ms = 0;
+static uint64_t gap_ms = 0;
+static bool last_b0 = false;
+static bool last_known_b0 = false;
+static bool last_known_b1 = false;
+static bool step1_done = false;
+static bool step2_done = false;
+
+// Apagado escalonado
+static bool shutting_down = false;
+static uint64_t shutdown_deadline_ms = 0;
+
+// RMS (placeholder para futuro uso)
 static float    current_rms_voltage = 0.0f;
 static uint64_t last_rms_measurement = 0;
 static const uint64_t RMS_MEASUREMENT_INTERVAL = 500; // ms
 
 // Helpers tiempo
-static inline uint64_t now_us() { return (uint64_t)esp_timer_get_time(); }
-static inline uint64_t now_ms() { return now_us() / 1000ULL; }
+static inline uint64_t now_us(){ return (uint64_t)esp_timer_get_time(); }
+static inline uint64_t now_ms(){ return now_us() / 1000ULL; }
 
 // ===================== Forward decl =====================
-static void zero_crossing_isr_handler(void* arg);
-static bool scr_fire_timer_isr(gptimer_handle_t, const gptimer_alarm_event_data_t*, void*);
+static void IRAM_ATTR zero_crossing_isr_handler(void* arg);
+static bool  IRAM_ATTR scr_fire_timer_isr(gptimer_handle_t, const gptimer_alarm_event_data_t*, void*);
 
 bool     mcp23017_read_register_protected(uint8_t reg, uint8_t *value);
 bool     mcp23017_write_register_protected(uint8_t reg, uint8_t value);
@@ -155,7 +218,7 @@ void     initialize_phase(phase_config_t *phase, int timer_idx);
 static   void init_zc_timebase_1mhz();
 
 // ===================== I2C base =====================
-bool mcp23017_write_register(uint8_t reg, uint8_t value) {
+bool mcp23017_write_register(uint8_t reg, uint8_t value){
     i2c_cmd_handle_t cmd = i2c_cmd_link_create();
     i2c_master_start(cmd);
     i2c_master_write_byte(cmd, (MCP23017_ADDR << 1) | I2C_MASTER_WRITE, true);
@@ -164,11 +227,11 @@ bool mcp23017_write_register(uint8_t reg, uint8_t value) {
     i2c_master_stop(cmd);
     esp_err_t ret = i2c_master_cmd_begin(I2C_PORT, cmd, pdMS_TO_TICKS(100));
     i2c_cmd_link_delete(cmd);
-    if (ret != ESP_OK) { LOGE("I2C", "MCP W reg=0x%02X err=%d", reg, ret); return false; }
+    if (ret != ESP_OK){ LOGE("I2C", "MCP W reg=0x%02X err=%d", reg, ret); return false; }
     return true;
 }
 
-bool mcp23017_read_register(uint8_t reg, uint8_t *value) {
+bool mcp23017_read_register(uint8_t reg, uint8_t *value){
     i2c_cmd_handle_t cmd = i2c_cmd_link_create();
     i2c_master_start(cmd);
     i2c_master_write_byte(cmd, (MCP23017_ADDR << 1) | I2C_MASTER_WRITE, true);
@@ -179,15 +242,13 @@ bool mcp23017_read_register(uint8_t reg, uint8_t *value) {
     i2c_master_stop(cmd);
     esp_err_t ret = i2c_master_cmd_begin(I2C_PORT, cmd, pdMS_TO_TICKS(100));
     i2c_cmd_link_delete(cmd);
-    if (ret != ESP_OK) { LOGE("I2C", "MCP R reg=0x%02X err=%d", reg, ret); return false; }
+    if (ret != ESP_OK){ LOGE("I2C", "MCP R reg=0x%02X err=%d", reg, ret); return false; }
     return true;
 }
 
-int32_t ads1115_read_raw() {
+int32_t ads1115_read_raw(){
     uint8_t data[2];
-    uint8_t config_buf[3] = { ADS1115_REG_CONFIG,
-                              (uint8_t)(ADS1115_CONFIG_START >> 8),
-                              (uint8_t)(ADS1115_CONFIG_START & 0xFF) };
+    uint8_t config_buf[3] = { ADS1115_REG_CONFIG, (uint8_t)(ADS1115_CONFIG_START >> 8), (uint8_t)(ADS1115_CONFIG_START & 0xFF) };
 
     i2c_cmd_handle_t cmd = i2c_cmd_link_create();
     i2c_master_start(cmd);
@@ -196,7 +257,7 @@ int32_t ads1115_read_raw() {
     i2c_master_stop(cmd);
     esp_err_t ret = i2c_master_cmd_begin(I2C_PORT, cmd, pdMS_TO_TICKS(100));
     i2c_cmd_link_delete(cmd);
-    if (ret != ESP_OK) { LOGE("I2C", "ADS(0x48) cfg err=%d", ret); return 0; }
+    if (ret != ESP_OK){ LOGE("I2C", "ADS(0x48) cfg err=%d", ret); return 0; }
 
     vTaskDelay(pdMS_TO_TICKS(10));
 
@@ -210,14 +271,14 @@ int32_t ads1115_read_raw() {
     i2c_master_stop(cmd);
     ret = i2c_master_cmd_begin(I2C_PORT, cmd, pdMS_TO_TICKS(100));
     i2c_cmd_link_delete(cmd);
-    if (ret != ESP_OK) { LOGE("I2C", "ADS(0x48) conv err=%d", ret); return 0; }
+    if (ret != ESP_OK){ LOGE("I2C", "ADS(0x48) conv err=%d", ret); return 0; }
 
     int16_t raw_value = (data[0] << 8) | data[1];
     return raw_value;
 }
 
 // ===================== Protegidas con mutex =====================
-bool mcp23017_write_register_protected(uint8_t reg, uint8_t value) {
+bool mcp23017_write_register_protected(uint8_t reg, uint8_t value){
     if (xSemaphoreTake(i2c_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
         bool ok = mcp23017_write_register(reg, value);
         xSemaphoreGive(i2c_mutex);
@@ -227,7 +288,7 @@ bool mcp23017_write_register_protected(uint8_t reg, uint8_t value) {
     return false;
 }
 
-bool mcp23017_read_register_protected(uint8_t reg, uint8_t *value) {
+bool mcp23017_read_register_protected(uint8_t reg, uint8_t *value){
     if (xSemaphoreTake(i2c_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
         for (int retry = 0; retry < 3; retry++) {
             if (mcp23017_read_register(reg, value)) { xSemaphoreGive(i2c_mutex); return true; }
@@ -243,7 +304,7 @@ bool mcp23017_read_register_protected(uint8_t reg, uint8_t *value) {
     return false;
 }
 
-int32_t ads1115_read_raw_protected() {
+int32_t ads1115_read_raw_protected(){
     if (xSemaphoreTake(i2c_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
         int32_t r = ads1115_read_raw();
         xSemaphoreGive(i2c_mutex);
@@ -253,339 +314,356 @@ int32_t ads1115_read_raw_protected() {
     return 0;
 }
 
+int32_t ads1115_read_raw_diff_49(){
+    constexpr uint16_t ADS1115_CONFIG_DIFF01_256 = 0x8B83;
+
+    uint8_t data[2];
+    uint8_t cfg[3] = { ADS1115_REG_CONFIG, (uint8_t)(ADS1115_CONFIG_DIFF01_256 >> 8), (uint8_t)(ADS1115_CONFIG_DIFF01_256 & 0xFF) };
+
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (ADS1115_ADDR_2 << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write(cmd, cfg, 3, true);
+    i2c_master_stop(cmd);
+    esp_err_t ret = i2c_master_cmd_begin(I2C_PORT, cmd, pdMS_TO_TICKS(100));
+    i2c_cmd_link_delete(cmd);
+    if (ret != ESP_OK){ LOGE("I2C", "ADS(0x49) cfg err=%d", ret); return 0; }
+
+    vTaskDelay(pdMS_TO_TICKS(10));
+
+    cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (ADS1115_ADDR_2 << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(cmd, ADS1115_REG_CONVERSION, true);
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (ADS1115_ADDR_2 << 1) | I2C_MASTER_READ, true);
+    i2c_master_read(cmd, data, 2, I2C_MASTER_LAST_NACK);
+    i2c_master_stop(cmd);
+    ret = i2c_master_cmd_begin(I2C_PORT, cmd, pdMS_TO_TICKS(100));
+    i2c_cmd_link_delete(cmd);
+    if (ret != ESP_OK){ LOGE("I2C", "ADS(0x49) conv err=%d", ret); return 0; }
+
+    int16_t raw = (int16_t)((data[0] << 8) | data[1]);
+    return (int32_t)raw;
+}
+
+int32_t ads1115_read_raw_diff_49_protected(){
+    if (xSemaphoreTake(i2c_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        int32_t r = ads1115_read_raw_diff_49();
+        xSemaphoreGive(i2c_mutex);
+        return r;
+    }
+    LOGW("I2C", "Timeout ADS(0x49) diff read");
+    return 0;
+}
+
 // ===================== MCP y utilitarios =====================
-void init_mcp23017() {
+void init_mcp23017(){
     mcp23017_write_register_protected(MCP23017_IODIRA, 0x00);
     mcp23017_write_register_protected(MCP23017_IODIRB, 0x03);
     mcp23017_write_register_protected(MCP23017_GPPUB,  0x03);
     mcp23017_write_register_protected(MCP23017_GPIOA,  0x00);
-    LOGI("BOOT", "MCP23017 init A0,A1 out; B0,B1 in+pullup");
+    LOGI("BOOT", "MCP23017 init A0..A3 out; B0,B1 in+pullup");
 }
 
-void update_relays() {
+static inline void apply_relays(){
     uint8_t relay_state = 0x00;
-    if (system_enabled)  relay_state |= 0x01;
-    if (relay_a1_state)  relay_state |= 0x02;
-    if (system_ready)    relay_state |= 0x08;
+    if (a0_on) relay_state |= 0x01;
+    if (a1_on) relay_state |= 0x02;
+    if (a2_on) relay_state |= 0x04;
+    if (a3_on) relay_state |= 0x08;
     mcp23017_write_register_protected(MCP23017_GPIOA, relay_state);
-    LOGI("RELAYS", "A0=%s A1=%s A3=%s",
-        system_enabled?"ON":"OFF",
-        relay_a1_state?"ON":"OFF",
-        system_ready?"ON":"OFF");
+    LOGI("RELAYS","A0=%s A1=%s A2=%s A3=%s", a0_on?"ON":"OFF", a1_on?"ON":"OFF", a2_on?"ON":"OFF", a3_on?"ON":"OFF");
 }
 
-void update_phases_based_on_potentiometer(int32_t filtered_value) {
-    if (!system_ready) {
-        for (int i=0;i<NUM_PHASES;i++) phases[i].enabled = false;
-        return;
-    }
-
-    if (relay_a1_state) {
-        if (filtered_value <= ONE_PHASE_THRESHOLD) {
-            phases[0].enabled=false; phases[1].enabled=false; phases[2].enabled=true;
-            LOGI("MODE","1 fase (B) v=%ld", filtered_value);
-        } else if (filtered_value <= TWO_PHASE_THRESHOLD) {
-            phases[0].enabled=false; phases[1].enabled=true; phases[2].enabled=true;
-            LOGI("MODE","2 fases (B,C) v=%ld", filtered_value);
-        } else {
-            phases[0].enabled=true; phases[1].enabled=true; phases[2].enabled=true;
-            LOGI("MODE","3 fases (A,B,C) v=%ld", filtered_value);
-        }
-    } 
-    ////////////
-    else {
-        if (filtered_value <= ONE_PHASE_THRESHOLD) {
-            phases[0].enabled=false; phases[1].enabled=false; phases[2].enabled=true;
-            LOGI("MODE","1 fase (B) v=%ld", filtered_value);
-        } else if (filtered_value <= TWO_PHASE_THRESHOLD) {
-            phases[0].enabled=false; phases[1].enabled=true; phases[2].enabled=true;
-            LOGI("MODE","2 fases (B,C) v=%ld", filtered_value);
-        } else {
-            phases[0].enabled=true; phases[1].enabled=true; phases[2].enabled=true;
-            LOGI("MODE","3 fases (A,B,C) v=%ld", filtered_value);
-        }
-    }
-    /*else {
-        phases[0].enabled= true; phases[1].enabled=true; phases[2].enabled=true;
-        LOGI("MODE","Reversa 2 fases (B,C) v=%ld", filtered_value);
-    }*/
+static inline void set_direction_from_b1_raw(bool b1_active_low){
+    a2_on = !b1_active_low;     // B1=0 -> A2 ON
+    a3_on = b1_active_low;    // B1=1 -> A3 ON
 }
 
-void read_buttons() {
-    static uint64_t last_ms = 0, hold_ms = 0, gap_ms = 0;
-    static bool last_b0 = false;
-    static bool last_known_b0 = false;
-    static bool last_known_b1 = false;
+void update_phases_based_on_potentiometer(int32_t filtered_value){
+    if (!scr_enabled) { for (int i=0;i<NUM_PHASES;i++) phases[i].enabled = false; return; }
 
+    if (filtered_value <= RAW_V_MIN){
+        phases[0].enabled=false; phases[1].enabled=false; phases[2].enabled=false;
+        LOGI("MODE","0 ALL PHASES DISABLED");
+    } else if (filtered_value > RAW_V_MIN && filtered_value <= ONE_PHASE_THRESHOLD){
+        phases[0].enabled=false; phases[1].enabled=true; phases[2].enabled=true;
+        LOGI("MODE","1 fase (B) v=%ld", filtered_value);
+    } else if (filtered_value <= TWO_PHASE_THRESHOLD){
+        phases[0].enabled=false; phases[1].enabled=true; phases[2].enabled=true;
+        LOGI("MODE","2 fases (B,C) v=%ld", filtered_value);
+    } else {
+        phases[0].enabled=true; phases[1].enabled=true; phases[2].enabled=true;
+        LOGI("MODE","3 fases (A,B,C) v=%ld", filtered_value);
+    }
+}
+
+void read_buttons(){
+    static uint64_t last_ms = 0;
     const uint64_t now = now_ms();
     uint64_t dt = (last_ms==0)? 0 : (now - last_ms);
     last_ms = now;
 
-    // Lee MCP; si falla, usa últimos estados válidos y limita dt
-    uint8_t pb = 0;
-    bool ok = mcp23017_read_register_protected(MCP23017_GPIOB, &pb);
+    uint8_t pb = 0; bool ok = mcp23017_read_register_protected(MCP23017_GPIOB, &pb);
 
-    bool b0_active, b1_active;
-    if (ok) {
-        b0_active = !(pb & 0x01);  // START activo en 0
-        b1_active = !(pb & 0x02);  // DIRECCIÓN activo en 0
+    bool b0_active, b1_active_low;
+    if (ok){
+        b0_active     = !(pb & 0x01);
+        b1_active_low = !(pb & 0x02);
         last_known_b0 = b0_active;
-        last_known_b1 = b1_active;
+        last_known_b1 = b1_active_low;
     } else {
-        b0_active = last_known_b0;
-        b1_active = last_known_b1;
+        b0_active     = last_known_b0;
+        b1_active_low = last_known_b1;
         if (dt > FAIL_DT_CAP_MS) dt = FAIL_DT_CAP_MS;
     }
 
-    // Acumulador tolerante a huecos para long-press
-    if (b0_active) {
-        if (gap_ms <= MAX_GAP_TOL_MS) hold_ms += dt;
-        else                          hold_ms  = 0;
+    if (b0_active){
+        if (gap_ms <= MAX_GAP_TOL_MS) start_hold_ms += dt; else start_hold_ms = 0;
         gap_ms = 0;
     } else {
         gap_ms += dt;
-        if (gap_ms > MAX_GAP_TOL_MS) hold_ms = 0;
+        if (gap_ms > MAX_GAP_TOL_MS) start_hold_ms = 0;
     }
 
-    // Logs de flanco
     if (b0_active && !last_b0) LOGI("BTN","START down");
     if (!b0_active && last_b0) LOGI("BTN","START up");
     last_b0 = b0_active;
 
-    // ACTIVAR: mantener START 3 s
-    if (!system_enabled && hold_ms >= LONG_PRESS_MS) {
-        system_enabled = true;     // A0 ON
-        system_ready   = false;    // A3 OFF
-        relay_a1_state = !b1_active;
-        system_activation_time = now;
-        update_relays();
-        LOGI("STATE","ACTIVADO (%.1fs)", (double)hold_ms/1000.0);
-        hold_ms = 0;
-        gap_ms  = 0;
-    }
-
-    // Habilitar pulsos 2 s después de activar
-    if (system_enabled && !system_ready) {
-        if ((now - system_activation_time) >= 2000) {
-            system_ready = true;   // A3 ON
-            update_relays();
-            LOGI("STATE","LISTO, pulsos habilitados");
+    if (!shutting_down){
+        if (!step1_done && start_hold_ms >= STEP1_MS){
+            a0_on = true; scr_enabled = true; a1_on = false; a2_on = false; a3_on = false;
+            step1_done = true;
+            LOGI("STATE","STEP1: A0 ON + SCR habilitados"); apply_relays();
+        }
+        if (!step2_done && start_hold_ms >= STEP2_MS){
+            a1_on = true; set_direction_from_b1_raw(b1_active_low); step2_done = true;
+            LOGI("STATE","STEP2: A1 ON + Dirección fijada"); apply_relays();
         }
     }
 
-    // Dirección: permite SOLO cuando listo (puedes cambiar a 'system_enabled' si quieres el comportamiento antiguo)
-    if (system_enabled && system_ready) {
-        bool new_a1 = !b1_active;
-        if (new_a1 != relay_a1_state) { relay_a1_state = new_a1; update_relays(); }
-    } else if (!system_enabled && relay_a1_state) {
-        relay_a1_state = false; update_relays();
+    const bool any_on = (a0_on || a1_on || a2_on || a3_on || scr_enabled);
+    if (!b0_active && any_on && !shutting_down && gap_ms > MAX_GAP_TOL_MS){
+        a1_on = false; scr_enabled = false; a0_on = false;
+        for (int i=0;i<NUM_PHASES;i++){ phases[i].enabled=false; gpio_set_level(phases[i].output_pin,0); gptimer_stop(phases[i].timer); }
+        apply_relays();
+        LOGI("STATE","Apagado inmediato: A1 OFF + SCR OFF + A0 OFF");
+        shutting_down = true; shutdown_deadline_ms = now + 1000; start_hold_ms = 0;
     }
 
-    // APAGADO SEGURO (forma de tu código antiguo):
-    // Al SOLTAR START de verdad: 1) Apaga SCRs y A3; 2) espera 2 s; 3) Apaga A0
-    static bool shutting_down = false;
-    static uint64_t off_deadline = 0;
-
-    // Paso 2 y 3 en curso
-    if (shutting_down) {
-        if (now >= off_deadline) {
-            system_enabled = false;   // A0 OFF tras 2 s
-            update_relays();
-            LOGI("STATE","Apagado completo: A0 OFF");
-            shutting_down = false;
-        }
-        return; // mientras apagas, no proceses más lógica
-    }
-
-    // Detecta SOLTAR START real con sistema activo
-    if (system_enabled && !b0_active && gap_ms > MAX_GAP_TOL_MS) {
-        LOGI("STATE","Inicio apagado seguro: A3 OFF y SCRs OFF");
-        system_ready = false; // A3 OFF
-
-        // Apaga pulsos inmediatamente
-        for (int i=0;i<NUM_PHASES;i++){
-            phases[i].enabled = false;
-            gpio_set_level(phases[i].output_pin, 0);
-            gptimer_stop(phases[i].timer);
-        }
-        update_relays();
-
-        // Programa A0 OFF en 2 s
-        shutting_down = true;
-        off_deadline  = now + 2000;
-
-        // limpia acumuladores de botón
-        hold_ms = 0;
-        return;
+    if (shutting_down && now >= shutdown_deadline_ms){
+        a2_on = false; a3_on = false; apply_relays();
+        LOGI("STATE","Apagado final: A1 OFF y A2/A3 OFF");
+        shutting_down = false; step1_done = false; step2_done = false;
     }
 }
 
-
-
 // ===================== Filtro =====================
-int32_t get_i2c_filtered_value(int32_t raw_value) {
-    int32_t current_reading = raw_value;
-    if (current_reading == 0 && buffer_index > 0)
-        return reading_buffer[(buffer_index - 1 + FILTER_SIZE) % FILTER_SIZE];
-
-    reading_buffer[buffer_index] = current_reading;
+int32_t get_i2c_filtered_value(int32_t raw_value){
+    static bool init = false;
+    if (!init){ for (int i=0;i<FILTER_SIZE;i++) reading_buffer[i]=raw_value; buffer_index=0; init=true; }
+    reading_buffer[buffer_index] = raw_value;
     buffer_index = (buffer_index + 1) % FILTER_SIZE;
+    int64_t sum = 0; for (int i=0;i<FILTER_SIZE;i++) sum += reading_buffer[i];
+    return (int32_t)(sum / FILTER_SIZE);
+}
 
-    int64_t sum = 0;
-    for (int i=0;i<FILTER_SIZE;i++) sum += reading_buffer[i];
-    int32_t filtered_value = (int32_t)(sum / FILTER_SIZE);
-
-    if (filtered_value < RAW_V_MIN) return RAW_V_MIN;
-    if (filtered_value > RAW_V_MAX) return RAW_V_MAX;
-    return filtered_value;
+static inline int32_t clamp_ads(int32_t v){
+    if (v < RAW_V_MIN) return RAW_V_MIN;
+    if (v > RAW_V_MAX) return RAW_V_MAX;
+    return v;
 }
 
 // ===================== ISR SCR timer =====================
-static bool IRAM_ATTR scr_fire_timer_isr(gptimer_handle_t timer, const gptimer_alarm_event_data_t*, void *user_ctx) {
+static bool IRAM_ATTR scr_fire_timer_isr(gptimer_handle_t timer, const gptimer_alarm_event_data_t*, void *user_ctx){
     phase_config_t *phase = (phase_config_t *)user_ctx;
-    if (!phase->enabled) { gptimer_stop(timer); return false; }
+    if (!phase->enabled){
+        gpio_set_level(phase->output_pin, 0);
+        gptimer_stop(timer);
+        phase->pulse_high = false;
+        return false;
+    }
 
-    int zc_state = gpio_get_level(phase->zc_pin);
-    if (zc_state == 0) {
+    if (!phase->pulse_high){
         gpio_set_level(phase->output_pin, 1);
-    } else {
-        gptimer_alarm_config_t alarm_config = { .alarm_count = 2, .reload_count = 0, .flags = {0} };
-        gptimer_set_alarm_action(timer, &alarm_config);
+        phase->pulse_high = true;
+
+        gptimer_alarm_config_t pw = { .alarm_count = ZC_PULSE_WIDTH_US, .reload_count = 0, .flags = {0} };
+        gptimer_set_alarm_action(timer, &pw);
         gptimer_set_raw_count(timer, 0);
         gptimer_start(timer);
+    } else {
         gpio_set_level(phase->output_pin, 0);
+        phase->pulse_high = false;
+        gptimer_stop(timer);
     }
     return false;
 }
 
-// ===================== ISR ZC sin APIs no-IRAM =====================
-static void IRAM_ATTR zero_crossing_isr_handler(void* arg) {
+// ===================== ISR ZC =====================
+static void IRAM_ATTR zero_crossing_isr_handler(void* arg){
     phase_config_t *phase = (phase_config_t *)arg;
+
     uint64_t now_tick = 0;
-    gptimer_get_raw_count(zc_timebase, &now_tick); // 1 tick = 1 us
+    gptimer_get_raw_count(zc_timebase, &now_tick);
+
+    // Medir ancho de pulso (si está en flanco de subida)
+    if (gpio_get_level(phase->zc_pin)) {
+        zc_rise_time[phase->phase_index] = now_tick;
+    } else {
+        // Flanco de bajada - calcular ancho de pulso
+        if (zc_rise_time[phase->phase_index] > 0) {
+            zc_pulse_width[phase->phase_index] = now_tick - zc_rise_time[phase->phase_index];
+        }
+    }
 
     uint64_t last = last_zc_tick[phase->phase_index];
     if ((uint64_t)(now_tick - last) < (uint64_t)DEBOUNCE_TIME_US) return;
     last_zc_tick[phase->phase_index] = now_tick;
 
+    // Reset del pulso
     gpio_set_level(phase->output_pin, 0);
-    gptimer_stop(phase->timer);
+    phase->pulse_high = false;
 
-    if (phase->enabled) {
-        uint32_t current_delay = phase->delay_us;
-        if (current_delay < MIN_DELAY_US) current_delay = MIN_DELAY_US;
-        if (current_delay > MAX_DELAY_US) current_delay = MAX_DELAY_US;
+    // Solo reprogramar si está habilitado
+    if (phase->enabled){
+        uint32_t d = phase->delay_us;
+        if (d < MIN_DELAY_US) d = MIN_DELAY_US;
+        if (d > 8330) d = 8330;
 
-        gptimer_alarm_config_t alarm_config = { .alarm_count = (uint64_t)current_delay,
-                                                .reload_count = 0, .flags = {0} };
-        gptimer_set_alarm_action(phase->timer, &alarm_config);
+        // Detener timer solo si está corriendo
+        gptimer_stop(phase->timer);
+        
+        gptimer_alarm_config_t alarm = { 
+            .alarm_count = (uint64_t)d, 
+            .reload_count = 0, 
+            .flags = {0} 
+        };
+        gptimer_set_alarm_action(phase->timer, &alarm);
         gptimer_set_raw_count(phase->timer, 0);
         gptimer_start(phase->timer);
+    } else {
+        gptimer_stop(phase->timer);
     }
 }
 
 // ===================== Tareas =====================
-void button_control_task(void*) {
+void button_control_task(void*){
     esp_task_wdt_add(NULL);
-    const TickType_t period = pdMS_TO_TICKS(20); // más rápido para captar rebotes
-    for(;;){
-        esp_task_wdt_reset();
-        read_buttons();
-        vTaskDelay(period);
-    }
+    const TickType_t period = pdMS_TO_TICKS(20);
+    for(;;){ esp_task_wdt_reset(); read_buttons(); vTaskDelay(period); }
 }
 
-void dynamic_control_task(void*) {
+void dynamic_control_task(void*){
     esp_task_wdt_add(NULL);
-    uint32_t delay_range = MAX_DELAY_US - MIN_DELAY_US;
-
-    for (int i=0;i<FILTER_SIZE;i++){
+    
+    // Inicializar filtro
+    for (int i=0;i<FILTER_SIZE;i++){ 
         reading_buffer[i] = ads1115_read_raw_protected();
-        voltage_buffer[i] = 0.0f;
-        vTaskDelay(pdMS_TO_TICKS(20));
+        vTaskDelay(pdMS_TO_TICKS(5)); 
     }
 
+    // Rango REAL medido del potenciómetro
+    constexpr int32_t POT_MIN = 900;     // Valor mínimo que lees
+    constexpr int32_t POT_MAX = 19000;    // Valor máximo que lees (ajustar según necesites)
+    
+    // Delays deseados (reales)
+    constexpr uint32_t DELAY_REAL_MIN = 7500;
+    constexpr uint32_t DELAY_REAL_MAX = 8330;
+    constexpr uint32_t comp = 1;
+
+    // Delays con compensación de 1000μs
+    constexpr uint32_t DELAY_CONFIG_MIN = DELAY_REAL_MIN + comp;  // 6500
+    constexpr uint32_t DELAY_CONFIG_MAX = DELAY_REAL_MAX + comp;  // 7320
+
+    uint32_t new_delay_base = 8333;
+        
     for(;;){
         esp_task_wdt_reset();
-        uint64_t t = now_ms();
 
-        int32_t raw_value = ads1115_read_raw_protected();
-        int32_t i2c_value_filtered = get_i2c_filtered_value(raw_value);
-        if (i2c_value_filtered < RAW_V_MIN) i2c_value_filtered = RAW_V_MIN;
-        if (i2c_value_filtered > RAW_V_MAX) i2c_value_filtered = RAW_V_MAX;
-
-        if ((int64_t)(t - last_rms_measurement) >= (int64_t)RMS_MEASUREMENT_INTERVAL) {
-            float new_rms = 0.0f; // desactivada
-            if (new_rms >= 0) current_rms_voltage = new_rms;
-            last_rms_measurement = t;
+        // Leer potenciómetro
+        int32_t pot_raw = ads1115_read_raw_protected();
+        int32_t pot_filt = get_i2c_filtered_value(pot_raw);
+        
+        // DEBUG: Ver qué está pasando
+        static uint32_t debug_count = 0;
+        if (debug_count++ % 10 == 0) {
+            printf("[DEBUG] pot_raw=%ld, pot_filt=%ld\n", pot_raw, pot_filt);
         }
 
-        voltage_buffer[voltage_index] = current_rms_voltage;
-        voltage_index = (voltage_index + 1) % FILTER_SIZE;
+        // Limitar al rango REAL
+        if (pot_filt < POT_MIN) pot_filt = POT_MIN;
+        if (pot_filt > POT_MAX) pot_filt = POT_MAX;
 
-        float voltage_sum = 0; int valid_voltage_samples=0;
-        for (int i=0;i<FILTER_SIZE;i++){ if (voltage_buffer[i]>=0){ voltage_sum+=voltage_buffer[i]; valid_voltage_samples++; } }
-        float diff_voltage_filtered = (valid_voltage_samples>0)? voltage_sum/valid_voltage_samples : 0.0f;
-        (void)diff_voltage_filtered;
-
-        float ratio_saturated = 0.0f;
-        if (relay_a1_state) {
-            if (i2c_value_filtered <= ONE_PHASE_THRESHOLD) {
-                ratio_saturated = (float)(i2c_value_filtered-RAW_V_MIN)/(ONE_PHASE_THRESHOLD-RAW_V_MIN);
-            } else if (i2c_value_filtered <= TWO_PHASE_THRESHOLD) {
-                ratio_saturated = (float)(35 + i2c_value_filtered-ONE_PHASE_THRESHOLD)/(TWO_PHASE_THRESHOLD-ONE_PHASE_THRESHOLD);
-            } else {
-                ratio_saturated = (float)(200 + i2c_value_filtered-TWO_PHASE_THRESHOLD)/(RAW_V_MAX-TWO_PHASE_THRESHOLD);
-            }
-        } else {
-            ratio_saturated = (float)(i2c_value_filtered-RAW_V_MIN)/(RAW_V_MAX-RAW_V_MIN);
+        // Mapeo lineal INVERTIDO: pot bajo → delay alto
+        if (pot_filt < ONE_PHASE_THRESHOLD){
+            new_delay_base =  DELAY_CONFIG_MAX - 
+                                 (pot_filt - POT_MIN) * (DELAY_CONFIG_MAX - DELAY_CONFIG_MIN) / 
+                                 (ONE_PHASE_THRESHOLD - POT_MIN);
+        }       
+        else if ( pot_filt >= ONE_PHASE_THRESHOLD){
+            new_delay_base =  DELAY_CONFIG_MAX - 60 - 
+                                 (pot_filt - ONE_PHASE_THRESHOLD) * (DELAY_CONFIG_MAX - DELAY_CONFIG_MIN) / 
+                                 (ONE_PHASE_THRESHOLD - POT_MIN);
         }
-        if (ratio_saturated < 0.0f) ratio_saturated = 0.0f;
-        if (ratio_saturated > 1.0f) ratio_saturated = 1.0f;
-
-        uint32_t new_delay_base = (uint32_t)((1.0f - ratio_saturated) * delay_range) + MIN_DELAY_US;
-
-        if (system_enabled) {
+        // DEBUG: Ver el cálculo
+        if (debug_count % 10 == 1) {
+            new_delay_base--;
+            printf("[DEBUG] pot=%ld -> delay_calc=%lu\n", pot_filt, new_delay_base);
+            //if(new_delay_base < 8180){
+            //    new_delay_base = 8180;
+            //}
+        }
+        // Aplicar a todas las fases
+        if (scr_enabled){
             phases[0].delay_us = new_delay_base;
             phases[1].delay_us = new_delay_base;
             phases[2].delay_us = new_delay_base;
-            update_phases_based_on_potentiometer(i2c_value_filtered);
+            update_phases_based_on_potentiometer(pot_filt);
+        } else {
+            for (int i=0;i<NUM_PHASES;i++){
+                phases[i].enabled=false; 
+                gpio_set_level(phases[i].output_pin,0); 
+                gptimer_stop(phases[i].timer);
+            }
         }
 
         vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
 
-// Monitor: ÚNICA tarea que imprime
+// Monitor: única tarea que imprime
 void system_health_monitor(void*){
     printf("[HEALTH] Logger RAM activo. Sin persistencia.\n");
     static uint32_t sample = 0;
     for(;;){
-        uint8_t pb=0; bool ok_btn = mcp23017_read_register_protected(MCP23017_GPIOB, &pb);
-        int b0 = ok_btn ? !(pb&0x01) : -1;
-        int b1 = ok_btn ? !(pb&0x02) : -1;
+        uint8_t pb = 0;
+        bool ok_btn = mcp23017_read_register_protected(MCP23017_GPIOB, &pb);
+        int b0 = ok_btn ? !(pb & 0x01) : -1;
+        int b1 = ok_btn ? !(pb & 0x02) : -1;
 
-        printf(
-            "[HEALTH %lu] ok=%d rawB=0x%02X | B0=%d B1=%d | en=%d ready=%d dir=%d | "
-            "delayA=%lu delayB=%lu delayC=%lu\n",
-            (unsigned long)sample++,
-            (int)ok_btn,
-            (unsigned)pb,
-            b0, b1,
-            (int)system_enabled,
-            (int)system_ready,
-            (int)relay_a1_state,
-            (unsigned long)phases[0].delay_us,
-            (unsigned long)phases[1].delay_us,
-            (unsigned long)phases[2].delay_us
-        );
+        int32_t pot_raw    = ads1115_read_raw_protected();
+        int32_t pot_filt   = get_i2c_filtered_value(pot_raw);
+        int32_t pot_diff49 = 0; // opcional: ads1115_read_raw_diff_49_protected();
 
-        vTaskDelay(pdMS_TO_TICKS(5000));
+        printf("[HEALTH %lu] ok=%d rawB=0x%02X | B0=%d B1=%d | START=%d ENABLE=%d FORWARD=%d REVERSE=%d | SCR=%d | POT_RAW=%ld POT_FILT=%ld POT_DIFF49=%ld | delayA=%lu delayB=%lu delayC=%lu\n",
+               (unsigned long)sample++,
+               (int)ok_btn, (unsigned)pb,
+               b0, b1,
+               (int)a0_on, (int)a1_on, (int)a2_on, (int)a3_on,
+               (int)scr_enabled,
+               (long)pot_raw, (long)pot_filt, (long)pot_diff49,
+               (unsigned long)phases[0].delay_us,
+               (unsigned long)phases[1].delay_us,
+               (unsigned long)phases[2].delay_us);
+
+        vTaskDelay(pdMS_TO_TICKS(2000));
     }
 }
 
 // ===================== Timebase 1 MHz =====================
-static void init_zc_timebase_1mhz() {
+static void init_zc_timebase_1mhz(){
     gptimer_config_t cfg = {
         .clk_src = GPTIMER_CLK_SRC_DEFAULT,
         .direction = GPTIMER_COUNT_UP,
@@ -599,7 +677,7 @@ static void init_zc_timebase_1mhz() {
 }
 
 // ===================== Inicialización de fase =====================
-void initialize_phase(phase_config_t *phase, int timer_idx) {
+void initialize_phase(phase_config_t *phase, int timer_idx){
     gpio_config_t zc_config = {
         .pin_bit_mask = (1ULL << phase->zc_pin),
         .mode = GPIO_MODE_INPUT,
@@ -632,6 +710,8 @@ void initialize_phase(phase_config_t *phase, int timer_idx) {
     ESP_ERROR_CHECK(gptimer_enable(phase->timer));
 
     phase->phase_index = timer_idx;
+    phase->pulse_high = false;
+
     gpio_isr_handler_add(phase->zc_pin, zero_crossing_isr_handler, (void*)phase);
 
     LOGI("BOOT","Fase %c ZC=%d SCR=%d timer=%d",
@@ -640,7 +720,7 @@ void initialize_phase(phase_config_t *phase, int timer_idx) {
 }
 
 // ===================== I2C init / Enables =====================
-void i2c_master_init() {
+void i2c_master_init(){
     i2c_config_t conf = {
         .mode = I2C_MODE_MASTER,
         .sda_io_num = I2C_SDA_PIN,
@@ -655,7 +735,7 @@ void i2c_master_init() {
     LOGI("BOOT","I2C master SDA=%d SCL=%d", I2C_SDA_PIN, I2C_SCL_PIN);
 }
 
-void initialize_mcp_enables() {
+void initialize_mcp_enables(){
     const gpio_num_t pin_15 = GPIO_NUM_15;
     const gpio_num_t pin_41 = GPIO_NUM_41;
 
@@ -674,8 +754,8 @@ void initialize_mcp_enables() {
 }
 
 // ===================== app_main =====================
-extern "C" void app_main(void) {
-    esp_log_level_set("*", ESP_LOG_WARN); // silencia IDF por consola
+extern "C" void app_main(void){
+    esp_log_level_set("*", ESP_LOG_WARN);
 
     // WDT
     esp_task_wdt_config_t twdt_config = { .timeout_ms = 60000, .idle_core_mask = 0, .trigger_panic = true };
@@ -688,16 +768,14 @@ extern "C" void app_main(void) {
     // Mutex
     i2c_mutex    = xSemaphoreCreateMutex();
     system_mutex = xSemaphoreCreateMutex();
-    if (i2c_mutex == NULL || system_mutex == NULL) {
-        printf("[HEALTH] ERROR creando mutex\n");
-        return;
-    }
+    if (i2c_mutex == NULL || system_mutex == NULL) { printf("[HEALTH] ERROR creando mutex\n"); return; }
 
     initialize_mcp_enables();
     i2c_master_init();
     init_mcp23017();
 
-    gpio_install_isr_service(ESP_INTR_FLAG_IRAM);
+    esp_err_t gi = gpio_install_isr_service(ESP_INTR_FLAG_IRAM | ESP_INTR_FLAG_LEVEL3);
+    if (gi != ESP_OK && gi != ESP_ERR_INVALID_STATE) { printf("GPIO ISR err=%d\n", gi); return; }
     init_zc_timebase_1mhz();
 
     initialize_phase(&phases[0], 0);
@@ -710,8 +788,14 @@ extern "C" void app_main(void) {
 
     esp_task_wdt_add(NULL);
 
-    for(;;){
-        esp_task_wdt_reset();
-        vTaskDelay(pdMS_TO_TICKS(1000));
-    }
+    // === Wi-Fi y OTA por navegador ===
+    //esp_err_t w = wifi_init_sta_safe("SmartLabs", "20120415H");
+    //if (w != ESP_OK){
+    //    printf("[OTA] WiFi no disponible, err=%d\n", w);
+    //} else {
+        //esp_err_t h = http_ota_start(80);
+        //if (h != ESP_OK) printf("[OTA] HTTP OTA fallo: %d\n", h);
+    //}
+
+    for(;;){ esp_task_wdt_reset(); vTaskDelay(pdMS_TO_TICKS(1000)); }
 }
