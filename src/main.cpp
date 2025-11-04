@@ -26,9 +26,15 @@
 
 #include "http_ota.hpp"
 #include "ads1115.hpp"
+#include "variables.cpp"
+#include "INA226.hpp"
 
 static ADS1115* adc0 = nullptr; // 0x48
 static ADS1115* adc1 = nullptr; // 0x49
+
+static INA226* ina = nullptr;
+constexpr uint8_t INA226_ADDR = 0x40; // A0=A1=GND por defecto
+
 // ===================== Wi-Fi util =====================
 static EventGroupHandle_t s_wifi_eg = nullptr;
 #define WIFI_GOT_IP BIT0
@@ -88,7 +94,12 @@ constexpr uint32_t ZC_PULSE_WIDTH_US = 500;
 constexpr uint32_t DEBOUNCE_TIME_US  = 1000;
 
 constexpr int32_t  WORK_MIN      = 900;
-constexpr uint32_t MIN_DELAY_US  = 7500;
+int32_t  POT_MIN_COUNTS        = 200;
+int32_t  POT_MAX_COUNTS        = 20000;
+uint32_t DYNAMIC_CTRL_PERIOD_MS = 50;
+// (Opcional) debounce un poco más ajustado si tu ZC es limpio
+// constexpr uint32_t DEBOUNCE_TIME_US  = 400;
+
 constexpr uint32_t MAX_DELAY_US  = 8325;
 constexpr int32_t  STEP_COUNTS   = 70;
 constexpr uint32_t US_PER_STEP   = 1;
@@ -162,7 +173,6 @@ constexpr int32_t RAW_V_MAX            = 20000;
 constexpr int32_t ONE_PHASE_THRESHOLD  = 12000;
 constexpr int32_t TWO_PHASE_THRESHOLD  = 18000;
 
-constexpr uint32_t HALF_PERIOD_US     = 8333;     // 60 Hz
 constexpr uint32_t ZC_MARGIN_US       = 150;
 constexpr uint32_t PULSE_WIDTH_US     = ZC_PULSE_WIDTH_US;
 
@@ -442,77 +452,96 @@ static inline int32_t clamp_ads(int32_t v){
 }
 
 // ===================== ISR SCR timer =====================
-static bool IRAM_ATTR scr_fire_timer_isr(gptimer_handle_t timer, const gptimer_alarm_event_data_t*, void *user_ctx){
+static bool IRAM_ATTR scr_fire_timer_isr(gptimer_handle_t timer,
+                                         const gptimer_alarm_event_data_t*,
+                                         void *user_ctx)
+{
     phase_config_t *phase = (phase_config_t *)user_ctx;
-    if (!phase->enabled){
+
+    // Si deshabilitado, no dispares
+    if (!phase->enabled) {
         gpio_set_level(phase->output_pin, 0);
         gptimer_stop(timer);
         phase->pulse_high = false;
         return false;
     }
 
-    if (!phase->pulse_high){
-        gpio_set_level(phase->output_pin, 1);
-        phase->pulse_high = true;
+    // ONE-SHOT: subir a HIGH y detener el timer
+    gpio_set_level(phase->output_pin, 1);
+    phase->pulse_high = true;
 
-        gptimer_alarm_config_t pw = { .alarm_count = ZC_PULSE_WIDTH_US, .reload_count = 0, .flags = {0} };
-        gptimer_set_alarm_action(timer, &pw);
-        gptimer_set_raw_count(timer, 0);
-        gptimer_start(timer);
-    } else {
-        gpio_set_level(phase->output_pin, 0);
-        phase->pulse_high = false;
-        gptimer_stop(timer);
-    }
-    return false;
+    // Timer ya cumplió su función, lo detenemos.
+    gptimer_stop(timer);
+    return false; // no rearmamos nada aquí
 }
+
 
 // ===================== ISR ZC =====================
 static void IRAM_ATTR zero_crossing_isr_handler(void* arg){
     phase_config_t *phase = (phase_config_t *)arg;
 
+    // Tiempo base a 1 MHz (ya creada en init_zc_timebase_1mhz)
     uint64_t now_tick = 0;
     gptimer_get_raw_count(zc_timebase, &now_tick);
 
-    // Medir ancho de pulso (si está en flanco de subida)
-    if (gpio_get_level(phase->zc_pin)) {
-        zc_rise_time[phase->phase_index] = now_tick;
-    } else {
-        // Flanco de bajada - calcular ancho de pulso
-        if (zc_rise_time[phase->phase_index] > 0) {
-            zc_pulse_width[phase->phase_index] = now_tick - zc_rise_time[phase->phase_index];
+    // Nivel actual del pin ZC para saber si es RISING (1) o FALLING (0)
+    const int level = gpio_get_level(phase->zc_pin);
+
+    if (level) {
+        // ---------- RISING EDGE ----------
+        // Debounce solo para rising
+        uint64_t last = last_zc_rise_tick[phase->phase_index];
+        if ((uint64_t)(now_tick - last) < (uint64_t)ZC_RISE_DEBOUNCE_US) return;
+        last_zc_rise_tick[phase->phase_index] = now_tick;
+
+        // Asegura que el gate esté en LOW al ZC
+        gpio_set_level(phase->output_pin, 0);
+        phase->pulse_high = false;
+
+        if (phase->enabled) {
+            // Calcula y limita el retardo desde tu ZC detectado
+            uint32_t d = phase->delay_us;
+#ifdef MAX_DELAY_FROM_ZC_US
+            if (d < MIN_DELAY_US)         d = MIN_DELAY_US;
+            if (d > MAX_DELAY_FROM_ZC_US) d = MAX_DELAY_FROM_ZC_US;
+#else
+            if (d < MIN_DELAY_US) d = MIN_DELAY_US;
+            if (d > MAX_DELAY_US) d = MAX_DELAY_US;
+#endif
+
+            // Cancela cualquier programación previa y arma ONE-SHOT para encender HIGH
+            gptimer_stop(phase->timer);
+
+            gptimer_alarm_config_t alarm = {
+                .alarm_count  = (uint64_t)d,
+                .reload_count = 0,
+                .flags = {0}
+            };
+            gptimer_set_alarm_action(phase->timer, &alarm);
+            gptimer_set_raw_count(phase->timer, 0);
+            gptimer_start(phase->timer);
+        } else {
+            // Si está deshabilitada la fase, garantiza timer parado y salida en LOW
+            gptimer_stop(phase->timer);
         }
-    }
 
-    uint64_t last = last_zc_tick[phase->phase_index];
-    if ((uint64_t)(now_tick - last) < (uint64_t)DEBOUNCE_TIME_US) return;
-    last_zc_tick[phase->phase_index] = now_tick;
-
-    // Reset del pulso
-    gpio_set_level(phase->output_pin, 0);
-    phase->pulse_high = false;
-
-    // Solo reprogramar si está habilitado
-    if (phase->enabled){
-        uint32_t d = phase->delay_us;
-        if (d < MIN_DELAY_US) d = MIN_DELAY_US;
-        if (d > 8330) d = 8330;
-
-        // Detener timer solo si está corriendo
-        gptimer_stop(phase->timer);
-        
-        gptimer_alarm_config_t alarm = { 
-            .alarm_count = (uint64_t)d, 
-            .reload_count = 0, 
-            .flags = {0} 
-        };
-        gptimer_set_alarm_action(phase->timer, &alarm);
-        gptimer_set_raw_count(phase->timer, 0);
-        gptimer_start(phase->timer);
     } else {
+        // ---------- FALLING EDGE ----------
+        // Debounce solo para falling
+        uint64_t last = last_zc_fall_tick[phase->phase_index];
+        if ((uint64_t)(now_tick - last) < (uint64_t)ZC_FALL_DEBOUNCE_US) return;
+        last_zc_fall_tick[phase->phase_index] = now_tick;
+
+        // FALLING: apaga el gate y cancela el temporizador pendiente.
+        // Con esto, si el retardo 'd' era largo (p.ej. 7.8 ms), evitamos
+        // que el timer dispare el gate después del falling de este pulso ZC.
+        gpio_set_level(phase->output_pin, 0);
+        phase->pulse_high = false;
         gptimer_stop(phase->timer);
     }
 }
+
+
 
 // ===================== Tareas =====================
 void button_control_task(void*){
@@ -521,83 +550,87 @@ void button_control_task(void*){
     for(;;){ esp_task_wdt_reset(); read_buttons(); vTaskDelay(period); }
 }
 
-void dynamic_control_task(void*){
+void dynamic_control_task(void*)
+{
+    // --- WDT en esta tarea ---
     esp_task_wdt_add(NULL);
-    
-    // Inicializar filtro
-    for (int i=0;i<FILTER_SIZE;i++){ 
+
+    // ----------- (1) Inicialización del filtro -----------
+    // Suavizamos la primera lectura llenando el buffer
+    for (int i = 0; i < FILTER_SIZE; i++) {
         reading_buffer[i] = ads1115_read_raw_protected();
-        vTaskDelay(pdMS_TO_TICKS(5)); 
+        vTaskDelay(pdMS_TO_TICKS(5));
     }
 
-    // Rango REAL medido del potenciómetro
-    constexpr int32_t POT_MIN = 900;     // Valor mínimo que lees
-    constexpr int32_t POT_MAX = 19000;    // Valor máximo que lees (ajustar según necesites)
-    
-    // Delays deseados (reales)
-    constexpr uint32_t DELAY_REAL_MIN = 7500;
-    constexpr uint32_t DELAY_REAL_MAX = 8330;
-    constexpr uint32_t comp = 1;
+    // Delay base a partir del ZC (en us); arranca neutro (≈ medio ciclo)
+    uint32_t new_delay_from_zc_us = (MIN_DELAY_US + MAX_DELAY_FROM_ZC_US) / 2;
 
-    // Delays con compensación de 1000μs
-    constexpr uint32_t DELAY_CONFIG_MIN = DELAY_REAL_MIN + comp;  // 6500
-    constexpr uint32_t DELAY_CONFIG_MAX = DELAY_REAL_MAX + comp;  // 7320
-
-    uint32_t new_delay_base = 8333;
-        
-    for(;;){
+    for (;;) {
         esp_task_wdt_reset();
 
-        // Leer potenciómetro
-        int32_t pot_raw = ads1115_read_raw_protected();
-        int32_t pot_filt = get_i2c_filtered_value(pot_raw);
-        
-        // DEBUG: Ver qué está pasando
-        /*static uint32_t debug_count = 0;
-        if (debug_count++ % 10 == 0) {
-            printf("[DEBUG] pot_raw=%ld, pot_filt=%ld\n", pot_raw, pot_filt);
-        }*/
+        // ----------- (2) Lectura del potenciómetro -----------
+        g_pot_raw  = ads1115_read_raw_protected();
+        int32_t       pot_filt = get_i2c_filtered_value(g_pot_raw);
+        int32_t bus_mV = 0;
+        int32_t shunt_uV = 0;
+        if (ina) {
+            // Opción A: lectura directa sin esperar (rápida, suficiente para telemetría periódica)
+            bool ok_bus   = ina->readBusVoltage_mV(bus_mV,   /*wait_ready=*/false);
+            bool ok_shunt = ina->readShuntMicroVolts(shunt_uV, /*wait_ready=*/false);
 
-        // Limitar al rango REAL
-        if (pot_filt < POT_MIN) pot_filt = POT_MIN;
-        if (pot_filt > POT_MAX) pot_filt = POT_MAX;
-
-        // Mapeo lineal INVERTIDO: pot bajo → delay alto
-        if (pot_filt < ONE_PHASE_THRESHOLD){
-            new_delay_base =  DELAY_CONFIG_MAX - 
-                                 (pot_filt - POT_MIN) * (DELAY_CONFIG_MAX - DELAY_CONFIG_MIN) / 
-                                 (ONE_PHASE_THRESHOLD - POT_MIN);
-        }       
-        else if ( pot_filt >= ONE_PHASE_THRESHOLD){
-            new_delay_base =  DELAY_CONFIG_MAX - 60 - 
-                                 (pot_filt - ONE_PHASE_THRESHOLD) * (DELAY_CONFIG_MAX - DELAY_CONFIG_MIN) / 
-                                 (ONE_PHASE_THRESHOLD - POT_MIN);
+            if (ok_bus && ok_shunt) {
+                // Si quieres ver en consola:
+                // printf("[INA226] Bus=%ld mV  Shunt=%ld uV\n", (long)bus_mV, (long)shunt_uV);
+            }
         }
-        // DEBUG: Ver el cálculo
-        //if (debug_count % 10 == 1) {
-        //    new_delay_base--;
-        //    printf("[DEBUG] pot=%ld -> delay_calc=%lu\n", pot_filt, new_delay_base);
-            //if(new_delay_base < 8180){
-            //    new_delay_base = 8180;
-            //}
-        //}
-        // Aplicar a todas las fases
-        if (scr_enabled){
-            phases[0].delay_us = new_delay_base;
-            phases[1].delay_us = new_delay_base;
-            phases[2].delay_us = new_delay_base;
+        // Limitar a rango declarado
+        if (pot_filt < POT_MIN_COUNTS) pot_filt = POT_MIN_COUNTS;
+        if (pot_filt > POT_MAX_COUNTS) pot_filt = POT_MAX_COUNTS;
+
+        // ----------- (3) Mapeo lineal invertido -----------
+        // pot bajo  -> delay alto (más cerca de 180°)
+        // pot alto  -> delay bajo (más cerca de 0°)
+        const int32_t span_counts = (POT_MAX_COUNTS - POT_MIN_COUNTS);
+        const uint32_t span_delay = (MAX_DELAY_FROM_ZC_US - MIN_DELAY_US);
+
+        uint32_t k = (span_counts > 0) ? (uint32_t)(pot_filt - POT_MIN_COUNTS) : 0;
+
+        // new_delay = MAX - (k/span_counts)*span_delay
+        // hacemos la cuenta en 64 bits para evitar overflow
+        uint32_t mapped = (span_counts > 0)
+            ? (uint32_t)(( (uint64_t)k * (uint64_t)span_delay ) / (uint64_t)span_counts)
+            : 0;
+
+        new_delay_from_zc_us = (MAX_DELAY_FROM_ZC_US > mapped)
+            ? (MAX_DELAY_FROM_ZC_US - mapped)
+            : MIN_DELAY_US;
+
+        // Clamps defensivos (por ruido o errores de config)
+        if (new_delay_from_zc_us < MIN_DELAY_US)         new_delay_from_zc_us = MIN_DELAY_US;
+        if (new_delay_from_zc_us > MAX_DELAY_FROM_ZC_US) new_delay_from_zc_us = MAX_DELAY_FROM_ZC_US;
+
+        // ----------- (4) Aplicar al plan de disparo -----------
+        if (scr_enabled) {
+            // el mismo ángulo para las 3 fases (puedes diferenciar si quieres)
+            for (int i = 0; i < NUM_PHASES; i++) {
+                phases[i].delay_us = new_delay_from_zc_us;
+            }
+            // habilitar/deshabilitar fases según “pot_filt”
             update_phases_based_on_potentiometer(pot_filt);
         } else {
-            for (int i=0;i<NUM_PHASES;i++){
-                phases[i].enabled=false; 
-                gpio_set_level(phases[i].output_pin,0); 
+            // si SCR deshabilitados, garantizamos salidas en LOW y timers parados
+            for (int i = 0; i < NUM_PHASES; i++) {
+                phases[i].enabled = false;
+                gpio_set_level(phases[i].output_pin, 0);
                 gptimer_stop(phases[i].timer);
             }
         }
 
-        vTaskDelay(pdMS_TO_TICKS(50));
+        // ----------- (5) Periodicidad -----------
+        vTaskDelay(pdMS_TO_TICKS(DYNAMIC_CTRL_PERIOD_MS));
     }
 }
+
 
 // Monitor: única tarea que imprime
 void system_health_monitor(void*){
@@ -648,11 +681,13 @@ void initialize_phase(phase_config_t *phase, int timer_idx){
     gpio_config_t zc_config = {
         .pin_bit_mask = (1ULL << phase->zc_pin),
         .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_ENABLE,
-        .intr_type = GPIO_INTR_POSEDGE
+        .pull_up_en   = GPIO_PULLUP_ENABLE,    // típico con colector abierto a GND
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_ANYEDGE      // <- ANTES era POSEDGE
     };
     gpio_config(&zc_config);
+
+
 
     gpio_config_t output_config = {
         .pin_bit_mask = (1ULL << phase->output_pin),
@@ -749,6 +784,13 @@ extern "C" void app_main(void){
     adc0->begin();
     adc1->begin();
 
+    ina = new INA226(I2C_PORT, INA226_ADDR, i2c_mutex);
+    if (!ina->begin(INA226::Avg::AVG_64,
+                    INA226::Ct::CT_1100us,
+                    INA226::Ct::CT_1100us,
+                    INA226::Mode::SHUNT_BUS_CONT)) {
+        printf("[INA226] begin() FAIL\n");
+    }
 
     esp_err_t gi = gpio_install_isr_service(ESP_INTR_FLAG_IRAM | ESP_INTR_FLAG_LEVEL3);
     if (gi != ESP_OK && gi != ESP_ERR_INVALID_STATE) { printf("GPIO ISR err=%d\n", gi); return; }
