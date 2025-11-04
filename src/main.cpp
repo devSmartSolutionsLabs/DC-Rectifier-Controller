@@ -26,15 +26,18 @@
 
 #include "http_ota.hpp"
 #include "ads1115.hpp"
-#include "variables.cpp"
+#include "variables.hpp"
 #include "INA226.hpp"
 
 static ADS1115* adc0 = nullptr; // 0x48
 static ADS1115* adc1 = nullptr; // 0x49
 
 static INA226* ina = nullptr;
-constexpr uint8_t INA226_ADDR = 0x40; // A0=A1=GND por defecto
 
+constexpr gpio_num_t I2C1_SDA_PIN = GPIO_NUM_43;
+constexpr gpio_num_t I2C1_SCL_PIN = GPIO_NUM_44;
+constexpr i2c_port_t I2C_PORT_1   = I2C_NUM_1;
+constexpr uint8_t    INA226_ADDR  = 0x45;   // detectada en tu scan
 // ===================== Wi-Fi util =====================
 static EventGroupHandle_t s_wifi_eg = nullptr;
 #define WIFI_GOT_IP BIT0
@@ -94,9 +97,7 @@ constexpr uint32_t ZC_PULSE_WIDTH_US = 500;
 constexpr uint32_t DEBOUNCE_TIME_US  = 1000;
 
 constexpr int32_t  WORK_MIN      = 900;
-int32_t  POT_MIN_COUNTS        = 200;
-int32_t  POT_MAX_COUNTS        = 20000;
-uint32_t DYNAMIC_CTRL_PERIOD_MS = 50;
+
 // (Opcional) debounce un poco más ajustado si tu ZC es limpio
 // constexpr uint32_t DEBOUNCE_TIME_US  = 400;
 
@@ -540,8 +541,42 @@ static void IRAM_ATTR zero_crossing_isr_handler(void* arg){
         gptimer_stop(phase->timer);
     }
 }
+static void i2c_scan(i2c_port_t port) {
+    printf("[I2C SCAN] start\n");
+    for (uint8_t addr = 0x03; addr < 0x78; addr++) {
+        i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+        i2c_master_start(cmd);
+        i2c_master_write_byte(cmd, (addr << 1) | I2C_MASTER_WRITE, true);
+        i2c_master_stop(cmd);
+        esp_err_t err = i2c_master_cmd_begin(port, cmd, pdMS_TO_TICKS(50));
+        i2c_cmd_link_delete(cmd);
+        if (err == ESP_OK) {
+            printf("  - FOUND: 0x%02X\n", addr);
+        }
+    }
+    printf("[I2C SCAN] end\n");
+}
 
+static void ina226_debug_dump(INA226* ina) {
+    uint16_t cfg=0, mask=0, shunt=0, bus=0;
+    if (!ina) return;
 
+    bool ok_cfg  = ina->readReg16(INA226::REG_CONFIG, cfg);
+    bool ok_mask = ina->readReg16(INA226::REG_MASK_ENABLE, mask);
+    bool ok_sv   = ina->readReg16(INA226::REG_SHUNT_V, shunt);
+    bool ok_bv   = ina->readReg16(INA226::REG_BUS_V,   bus);
+
+    printf("[INA226 DUMP] ok_cfg=%d ok_mask=%d ok_sv=%d ok_bv=%d | "
+           "CFG=0x%04X MASK=0x%04X SHUNT=0x%04X BUS=0x%04X\n",
+           ok_cfg, ok_mask, ok_sv, ok_bv, cfg, mask, shunt, bus);
+
+    // Bits típicos a revisar en MASK/ENABLE (consulta tu datasheet exacto):
+    //  - CNVR (Conversion Ready)
+    //  - OVF  (Math Overflow)
+    bool cnvr = (mask & (1u<<3)) != 0;   // muchas variantes usan bit 3 para CNVR
+    bool ovf  = (mask & (1u<<0)) != 0;   // frecuentemente OVF en bit 0
+    printf("[INA226 DUMP] CNVR=%d OVF=%d\n", cnvr, ovf);
+}
 
 // ===================== Tareas =====================
 void button_control_task(void*){
@@ -552,73 +587,95 @@ void button_control_task(void*){
 
 void dynamic_control_task(void*)
 {
-    // --- WDT en esta tarea ---
     esp_task_wdt_add(NULL);
 
-    // ----------- (1) Inicialización del filtro -----------
-    // Suavizamos la primera lectura llenando el buffer
+    // (1) Seed del filtro del potenciómetro para evitar “saltos” al arranque
     for (int i = 0; i < FILTER_SIZE; i++) {
         reading_buffer[i] = ads1115_read_raw_protected();
         vTaskDelay(pdMS_TO_TICKS(5));
     }
 
-    // Delay base a partir del ZC (en us); arranca neutro (≈ medio ciclo)
+    // (2) Estado del EMA para INA226 (en float para suavizar; se publica en int32_t)
+    static float ema_bus_mV   = 0.0f;
+    static float ema_shunt_uV = 0.0f;
+    static bool  ema_init     = false;
+
+    // Delay base (desde tu ZC detectado)
     uint32_t new_delay_from_zc_us = (MIN_DELAY_US + MAX_DELAY_FROM_ZC_US) / 2;
 
     for (;;) {
         esp_task_wdt_reset();
 
-        // ----------- (2) Lectura del potenciómetro -----------
-        g_pot_raw  = ads1115_read_raw_protected();
-        int32_t       pot_filt = get_i2c_filtered_value(g_pot_raw);
-        int32_t bus_mV = 0;
-        int32_t shunt_uV = 0;
-        if (ina) {
-            // Opción A: lectura directa sin esperar (rápida, suficiente para telemetría periódica)
-            bool ok_bus   = ina->readBusVoltage_mV(bus_mV,   /*wait_ready=*/false);
-            bool ok_shunt = ina->readShuntMicroVolts(shunt_uV, /*wait_ready=*/false);
+        // ---------- POT (ADS1115) ----------
+        g_pot_raw = ads1115_read_raw_protected();
+        int32_t pot_filt = get_i2c_filtered_value(g_pot_raw);
 
-            if (ok_bus && ok_shunt) {
-                // Si quieres ver en consola:
-                // printf("[INA226] Bus=%ld mV  Shunt=%ld uV\n", (long)bus_mV, (long)shunt_uV);
-            }
-        }
-        // Limitar a rango declarado
         if (pot_filt < POT_MIN_COUNTS) pot_filt = POT_MIN_COUNTS;
         if (pot_filt > POT_MAX_COUNTS) pot_filt = POT_MAX_COUNTS;
 
-        // ----------- (3) Mapeo lineal invertido -----------
-        // pot bajo  -> delay alto (más cerca de 180°)
-        // pot alto  -> delay bajo (más cerca de 0°)
-        const int32_t span_counts = (POT_MAX_COUNTS - POT_MIN_COUNTS);
-        const uint32_t span_delay = (MAX_DELAY_FROM_ZC_US - MIN_DELAY_US);
-
+        // Map invertido: pot bajo -> delay alto
+        const int32_t  span_counts = (POT_MAX_COUNTS - POT_MIN_COUNTS);
+        const uint32_t span_delay  = (MAX_DELAY_FROM_ZC_US - MIN_DELAY_US);
         uint32_t k = (span_counts > 0) ? (uint32_t)(pot_filt - POT_MIN_COUNTS) : 0;
 
-        // new_delay = MAX - (k/span_counts)*span_delay
-        // hacemos la cuenta en 64 bits para evitar overflow
         uint32_t mapped = (span_counts > 0)
-            ? (uint32_t)(( (uint64_t)k * (uint64_t)span_delay ) / (uint64_t)span_counts)
-            : 0;
+                        ? (uint32_t)(((uint64_t)k * (uint64_t)span_delay) / (uint64_t)span_counts)
+                        : 0;
 
         new_delay_from_zc_us = (MAX_DELAY_FROM_ZC_US > mapped)
-            ? (MAX_DELAY_FROM_ZC_US - mapped)
-            : MIN_DELAY_US;
+                             ? (MAX_DELAY_FROM_ZC_US - mapped)
+                             : MIN_DELAY_US;
 
-        // Clamps defensivos (por ruido o errores de config)
         if (new_delay_from_zc_us < MIN_DELAY_US)         new_delay_from_zc_us = MIN_DELAY_US;
         if (new_delay_from_zc_us > MAX_DELAY_FROM_ZC_US) new_delay_from_zc_us = MAX_DELAY_FROM_ZC_US;
 
-        // ----------- (4) Aplicar al plan de disparo -----------
+        // ---------- INA226 (EMA > 1 ciclo 60 Hz) ----------
+        // Nota: El periodo de esta tarea define el dt del EMA
+        const float dt_ms   = (float)DYNAMIC_CTRL_PERIOD_MS;
+        float window_ms     = (float)INA_EMA_WINDOW_MS;
+        if (window_ms < dt_ms) window_ms = dt_ms;               // evitar alpha > 1
+        const float alpha   = dt_ms / window_ms;                 // 0 < alpha <= 1
+
+        int32_t bus_mV = 0;
+        int32_t shunt_uV = 0;
+
+        bool ok_bus = false;
+        bool ok_shunt = false;
+
+        if (ina && ina->waitConversionReady(30000)){
+            // Puedes habilitar el promedio interno del INA en begin(config) y aquí solo filtrar suave
+            // Si quieres asegurar muestra "nueva" de ambas rutas, configura el INA en SHUNT_BUS_CONT y AVG=N.
+            ok_bus   = ina->readBusVoltage_mV(bus_mV,     /*wait_ready=*/false);
+            ok_shunt = ina->readShuntMicroVolts(shunt_uV, /*wait_ready=*/false);
+
+            if (ok_bus && ok_shunt) {
+                if (!ema_init) {
+                    ema_bus_mV   = (float)bus_mV;
+                    ema_shunt_uV = (float)shunt_uV;
+                    ema_init     = true;
+                } else {
+                    ema_bus_mV   = ema_bus_mV   + alpha * ((float)bus_mV   - ema_bus_mV);
+                    ema_shunt_uV = ema_shunt_uV + alpha * ((float)shunt_uV - ema_shunt_uV);
+                }
+
+                // Publica valores “suavizados” para que los lea el HealthMonitor
+                g_ina_bus_mV_avg   = (int32_t)lrintf(ema_bus_mV);
+                g_ina_shunt_uV_avg = (int32_t)lrintf(ema_shunt_uV);
+                g_ina_ok       = true;
+            } else {
+                g_ina_ok = false;
+            }
+        } else {
+            g_ina_ok = false;
+        }
+
+        // ---------- Aplicar ángulo a las fases ----------
         if (scr_enabled) {
-            // el mismo ángulo para las 3 fases (puedes diferenciar si quieres)
             for (int i = 0; i < NUM_PHASES; i++) {
                 phases[i].delay_us = new_delay_from_zc_us;
             }
-            // habilitar/deshabilitar fases según “pot_filt”
             update_phases_based_on_potentiometer(pot_filt);
         } else {
-            // si SCR deshabilitados, garantizamos salidas en LOW y timers parados
             for (int i = 0; i < NUM_PHASES; i++) {
                 phases[i].enabled = false;
                 gpio_set_level(phases[i].output_pin, 0);
@@ -626,34 +683,42 @@ void dynamic_control_task(void*)
             }
         }
 
-        // ----------- (5) Periodicidad -----------
         vTaskDelay(pdMS_TO_TICKS(DYNAMIC_CTRL_PERIOD_MS));
     }
 }
 
 
+
 // Monitor: única tarea que imprime
-void system_health_monitor(void*){
+void system_health_monitor(void*)
+{
     printf("[HEALTH] Logger RAM activo. Sin persistencia.\n");
     static uint32_t sample = 0;
-    for(;;){
+    for (;;) {
         uint8_t pb = 0;
         bool ok_btn = mcp23017_read_register_protected(MCP23017_GPIOB, &pb);
         int b0 = ok_btn ? !(pb & 0x01) : -1;
         int b1 = ok_btn ? !(pb & 0x02) : -1;
 
-        int32_t pot_raw    = ads1115_read_raw_protected();
-        int32_t pot_filt   = get_i2c_filtered_value(pot_raw);
-        int32_t pot_diff49 = ads1115_read_small_signal_49_protected();
-        float pot_diff49_mv = ads1115_raw_to_mv(pot_diff49);
+        int32_t pot_raw  = g_pot_raw; // ya lo actualiza la tarea
+        int32_t pot_filt = get_i2c_filtered_value(pot_raw); // si quieres mostrar filtrado también
 
-        printf("[HEALTH %lu] ok=%d rawB=0x%02X | B0=%d B1=%d | START=%d ENABLE=%d FORWARD=%d REVERSE=%d | SCR=%d | POT_RAW=%ld POT_FILT=%ld POT_DIFF49=%ld | delayA=%lu delayB=%lu delayC=%lu\n",
+        // Imprime los promedios del INA (sin spam en la tarea)
+        if (g_ina_ok) {
+            printf("[INA226 AVG] Bus=%ld mV  Shunt=%ld uV\n",
+                   (long)g_ina_bus_mV_avg, (long)g_ina_shunt_uV_avg);
+        } else {
+            printf("[INA226] sin dato válido\n");
+        }
+
+        printf("[HEALTH %lu] ok=%d rawB=0x%02X | B0=%d B1=%d | START=%d ENABLE=%d FORWARD=%d REVERSE=%d "
+               "| SCR=%d | POT_RAW=%ld POT_FILT=%ld | delayA=%lu delayB=%lu delayC=%lu\n",
                (unsigned long)sample++,
                (int)ok_btn, (unsigned)pb,
                b0, b1,
                (int)a0_on, (int)a1_on, (int)a2_on, (int)a3_on,
                (int)scr_enabled,
-               (long)pot_raw, (long)pot_filt, (long)pot_diff49,
+               (long)pot_raw, (long)pot_filt,
                (unsigned long)phases[0].delay_us,
                (unsigned long)phases[1].delay_us,
                (unsigned long)phases[2].delay_us);
@@ -661,6 +726,7 @@ void system_health_monitor(void*){
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
+
 
 // ===================== Timebase 1 MHz =====================
 static void init_zc_timebase_1mhz(){
@@ -737,6 +803,20 @@ void i2c_master_init(){
     LOGI("BOOT","I2C master SDA=%d SCL=%d", I2C_SDA_PIN, I2C_SCL_PIN);
 }
 
+void i2c1_master_init(){
+    i2c_config_t conf = {
+        .mode = I2C_MODE_MASTER,
+        .sda_io_num = I2C1_SDA_PIN,
+        .scl_io_num = I2C1_SCL_PIN,
+        .sda_pullup_en = GPIO_PULLUP_ENABLE,   // mejor tener pull-ups externos también
+        .scl_pullup_en = GPIO_PULLUP_ENABLE,
+        .master = { .clk_speed = 400000 },     // 100k si necesitas máxima robustez
+        .clk_flags = 0
+    };
+    ESP_ERROR_CHECK(i2c_param_config(I2C_PORT_1, &conf));
+    ESP_ERROR_CHECK(i2c_driver_install(I2C_PORT_1, conf.mode, 0, 0, 0));
+}
+
 void initialize_mcp_enables(){
     const gpio_num_t pin_15 = GPIO_NUM_15;
     const gpio_num_t pin_41 = GPIO_NUM_41;
@@ -776,6 +856,10 @@ extern "C" void app_main(void){
 
     initialize_mcp_enables();
     i2c_master_init();
+    i2c1_master_init();
+
+    i2c_scan(I2C_PORT_1);
+
     init_mcp23017();
 
 
@@ -784,12 +868,16 @@ extern "C" void app_main(void){
     adc0->begin();
     adc1->begin();
 
-    ina = new INA226(I2C_PORT, INA226_ADDR, i2c_mutex);
-    if (!ina->begin(INA226::Avg::AVG_64,
-                    INA226::Ct::CT_1100us,
-                    INA226::Ct::CT_1100us,
+    ina = new INA226(I2C_PORT_1, INA226_ADDR, i2c_mutex);
+    if (!ina->begin(INA226::Avg::AVG_128,
+                    INA226::Ct::CT_588us,
+                    INA226::Ct::CT_588us,
                     INA226::Mode::SHUNT_BUS_CONT)) {
         printf("[INA226] begin() FAIL\n");
+    }
+
+    if (!g_ina_ok) {
+        printf("[INA226] begin() fallo. Revisa direccion y cableado.\n");
     }
 
     esp_err_t gi = gpio_install_isr_service(ESP_INTR_FLAG_IRAM | ESP_INTR_FLAG_LEVEL3);
