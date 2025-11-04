@@ -25,7 +25,10 @@
 #include "nvs_flash.h"
 
 #include "http_ota.hpp"
+#include "ads1115.hpp"
 
+static ADS1115* adc0 = nullptr; // 0x48
+static ADS1115* adc1 = nullptr; // 0x49
 // ===================== Wi-Fi util =====================
 static EventGroupHandle_t s_wifi_eg = nullptr;
 #define WIFI_GOT_IP BIT0
@@ -109,7 +112,7 @@ constexpr uint8_t MCP23017_GPIOB  = 0x13;
 constexpr uint8_t  ADS1115_REG_CONVERSION   = 0x00;
 constexpr uint8_t  ADS1115_REG_CONFIG       = 0x01;
 constexpr uint16_t ADS1115_CONFIG_START     = 0xC1C3;
-constexpr uint16_t ADS1115_CONFIG_DIFF_0_1  = 0xC583;
+constexpr uint16_t ADS1115_CONFIG_DIFF_0_1  = 0xC283;
 
 #define FILTER_SIZE 8
 
@@ -247,35 +250,18 @@ bool mcp23017_read_register(uint8_t reg, uint8_t *value){
 }
 
 int32_t ads1115_read_raw(){
-    uint8_t data[2];
-    uint8_t config_buf[3] = { ADS1115_REG_CONFIG, (uint8_t)(ADS1115_CONFIG_START >> 8), (uint8_t)(ADS1115_CONFIG_START & 0xFF) };
-
-    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
-    i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (ADS1115_ADDR_1 << 1) | I2C_MASTER_WRITE, true);
-    i2c_master_write(cmd, config_buf, 3, true);
-    i2c_master_stop(cmd);
-    esp_err_t ret = i2c_master_cmd_begin(I2C_PORT, cmd, pdMS_TO_TICKS(100));
-    i2c_cmd_link_delete(cmd);
-    if (ret != ESP_OK){ LOGE("I2C", "ADS(0x48) cfg err=%d", ret); return 0; }
-
-    vTaskDelay(pdMS_TO_TICKS(10));
-
-    cmd = i2c_cmd_link_create();
-    i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (ADS1115_ADDR_1 << 1) | I2C_MASTER_WRITE, true);
-    i2c_master_write_byte(cmd, ADS1115_REG_CONVERSION, true);
-    i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (ADS1115_ADDR_1 << 1) | I2C_MASTER_READ, true);
-    i2c_master_read(cmd, data, 2, I2C_MASTER_LAST_NACK);
-    i2c_master_stop(cmd);
-    ret = i2c_master_cmd_begin(I2C_PORT, cmd, pdMS_TO_TICKS(100));
-    i2c_cmd_link_delete(cmd);
-    if (ret != ESP_OK){ LOGE("I2C", "ADS(0x48) conv err=%d", ret); return 0; }
-
-    int16_t raw_value = (data[0] << 8) | data[1];
-    return raw_value;
+    if (!adc0) return 0;
+    int16_t raw = 0;
+    bool ok = adc0->singleShot(
+        ADS1115::Mux::AIN0_GND,
+        ADS1115::PGA::FS_6V144,
+        ADS1115::DataRate::SPS_128,
+        raw
+    );
+    if (!ok) { LOGE("I2C","ADS(0x48) read fail"); return 0; }
+    return (int32_t)raw;
 }
+
 
 // ===================== Protegidas con mutex =====================
 bool mcp23017_write_register_protected(uint8_t reg, uint8_t value){
@@ -305,57 +291,37 @@ bool mcp23017_read_register_protected(uint8_t reg, uint8_t *value){
 }
 
 int32_t ads1115_read_raw_protected(){
-    if (xSemaphoreTake(i2c_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        int32_t r = ads1115_read_raw();
-        xSemaphoreGive(i2c_mutex);
-        return r;
-    }
-    LOGW("I2C", "Timeout ADS(0x48) read");
-    return 0;
+    return ads1115_read_raw();
 }
 
-int32_t ads1115_read_raw_diff_49(){
-    constexpr uint16_t ADS1115_CONFIG_DIFF01_256 = 0x8B83;
+int32_t ads1115_read_small_signal_49() {
+    if (!adc1) return 0;
+    int16_t raw = 0;
+    bool ok = adc1->singleShot(
+        ADS1115::Mux::DIFF_0_1,
+        ADS1115::PGA::FS_0V256,
+        ADS1115::DataRate::SPS_16,
+        raw
+    );
+    if (!ok) return 0;
 
-    uint8_t data[2];
-    uint8_t cfg[3] = { ADS1115_REG_CONFIG, (uint8_t)(ADS1115_CONFIG_DIFF01_256 >> 8), (uint8_t)(ADS1115_CONFIG_DIFF01_256 & 0xFF) };
-
-    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
-    i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (ADS1115_ADDR_2 << 1) | I2C_MASTER_WRITE, true);
-    i2c_master_write(cmd, cfg, 3, true);
-    i2c_master_stop(cmd);
-    esp_err_t ret = i2c_master_cmd_begin(I2C_PORT, cmd, pdMS_TO_TICKS(100));
-    i2c_cmd_link_delete(cmd);
-    if (ret != ESP_OK){ LOGE("I2C", "ADS(0x49) cfg err=%d", ret); return 0; }
-
-    vTaskDelay(pdMS_TO_TICKS(10));
-
-    cmd = i2c_cmd_link_create();
-    i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (ADS1115_ADDR_2 << 1) | I2C_MASTER_WRITE, true);
-    i2c_master_write_byte(cmd, ADS1115_REG_CONVERSION, true);
-    i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (ADS1115_ADDR_2 << 1) | I2C_MASTER_READ, true);
-    i2c_master_read(cmd, data, 2, I2C_MASTER_LAST_NACK);
-    i2c_master_stop(cmd);
-    ret = i2c_master_cmd_begin(I2C_PORT, cmd, pdMS_TO_TICKS(100));
-    i2c_cmd_link_delete(cmd);
-    if (ret != ESP_OK){ LOGE("I2C", "ADS(0x49) conv err=%d", ret); return 0; }
-
-    int16_t raw = (int16_t)((data[0] << 8) | data[1]);
+    // Conversión a mV consistente con ±0.256 V
+    float voltage_mv = raw * (ADS1115::fsr_mV(ADS1115::PGA::FS_0V256) / 32768.0f);
+    printf("[ADS1115 0x49] Raw: %d, Voltage: %.3f mV\n", (int)raw, voltage_mv);
     return (int32_t)raw;
 }
 
-int32_t ads1115_read_raw_diff_49_protected(){
-    if (xSemaphoreTake(i2c_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        int32_t r = ads1115_read_raw_diff_49();
-        xSemaphoreGive(i2c_mutex);
-        return r;
-    }
-    LOGW("I2C", "Timeout ADS(0x49) diff read");
-    return 0;
+// Función para convertir a milivoltios
+float ads1115_raw_to_mv(int32_t raw_value) {
+    // ±256mV FSR, 16 bits
+    // raw_value: -32768 to +32767
+    return (raw_value * 256.0f) / 32768.0f;
 }
+
+int32_t ads1115_read_small_signal_49_protected(){
+    return ads1115_read_small_signal_49();
+}
+
 
 // ===================== MCP y utilitarios =====================
 void init_mcp23017(){
@@ -388,10 +354,10 @@ void update_phases_based_on_potentiometer(int32_t filtered_value){
         phases[0].enabled=false; phases[1].enabled=false; phases[2].enabled=false;
         LOGI("MODE","0 ALL PHASES DISABLED");
     } else if (filtered_value > RAW_V_MIN && filtered_value <= ONE_PHASE_THRESHOLD){
-        phases[0].enabled=false; phases[1].enabled=true; phases[2].enabled=true;
+        phases[0].enabled=true; phases[1].enabled=true; phases[2].enabled=true;
         LOGI("MODE","1 fase (B) v=%ld", filtered_value);
     } else if (filtered_value <= TWO_PHASE_THRESHOLD){
-        phases[0].enabled=false; phases[1].enabled=true; phases[2].enabled=true;
+        phases[0].enabled=true; phases[1].enabled=true; phases[2].enabled=true;
         LOGI("MODE","2 fases (B,C) v=%ld", filtered_value);
     } else {
         phases[0].enabled=true; phases[1].enabled=true; phases[2].enabled=true;
@@ -587,10 +553,10 @@ void dynamic_control_task(void*){
         int32_t pot_filt = get_i2c_filtered_value(pot_raw);
         
         // DEBUG: Ver qué está pasando
-        static uint32_t debug_count = 0;
+        /*static uint32_t debug_count = 0;
         if (debug_count++ % 10 == 0) {
             printf("[DEBUG] pot_raw=%ld, pot_filt=%ld\n", pot_raw, pot_filt);
-        }
+        }*/
 
         // Limitar al rango REAL
         if (pot_filt < POT_MIN) pot_filt = POT_MIN;
@@ -608,13 +574,13 @@ void dynamic_control_task(void*){
                                  (ONE_PHASE_THRESHOLD - POT_MIN);
         }
         // DEBUG: Ver el cálculo
-        if (debug_count % 10 == 1) {
-            new_delay_base--;
-            printf("[DEBUG] pot=%ld -> delay_calc=%lu\n", pot_filt, new_delay_base);
+        //if (debug_count % 10 == 1) {
+        //    new_delay_base--;
+        //    printf("[DEBUG] pot=%ld -> delay_calc=%lu\n", pot_filt, new_delay_base);
             //if(new_delay_base < 8180){
             //    new_delay_base = 8180;
             //}
-        }
+        //}
         // Aplicar a todas las fases
         if (scr_enabled){
             phases[0].delay_us = new_delay_base;
@@ -645,7 +611,8 @@ void system_health_monitor(void*){
 
         int32_t pot_raw    = ads1115_read_raw_protected();
         int32_t pot_filt   = get_i2c_filtered_value(pot_raw);
-        int32_t pot_diff49 = 0; // opcional: ads1115_read_raw_diff_49_protected();
+        int32_t pot_diff49 = ads1115_read_small_signal_49_protected();
+        float pot_diff49_mv = ads1115_raw_to_mv(pot_diff49);
 
         printf("[HEALTH %lu] ok=%d rawB=0x%02X | B0=%d B1=%d | START=%d ENABLE=%d FORWARD=%d REVERSE=%d | SCR=%d | POT_RAW=%ld POT_FILT=%ld POT_DIFF49=%ld | delayA=%lu delayB=%lu delayC=%lu\n",
                (unsigned long)sample++,
@@ -658,7 +625,7 @@ void system_health_monitor(void*){
                (unsigned long)phases[1].delay_us,
                (unsigned long)phases[2].delay_us);
 
-        vTaskDelay(pdMS_TO_TICKS(2000));
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
 
@@ -770,9 +737,18 @@ extern "C" void app_main(void){
     system_mutex = xSemaphoreCreateMutex();
     if (i2c_mutex == NULL || system_mutex == NULL) { printf("[HEALTH] ERROR creando mutex\n"); return; }
 
+    
+
     initialize_mcp_enables();
     i2c_master_init();
     init_mcp23017();
+
+
+    adc0 = new ADS1115(I2C_PORT, ADS1115_ADDR_1, i2c_mutex);
+    adc1 = new ADS1115(I2C_PORT, ADS1115_ADDR_2, i2c_mutex);
+    adc0->begin();
+    adc1->begin();
+
 
     esp_err_t gi = gpio_install_isr_service(ESP_INTR_FLAG_IRAM | ESP_INTR_FLAG_LEVEL3);
     if (gi != ESP_OK && gi != ESP_ERR_INVALID_STATE) { printf("GPIO ISR err=%d\n", gi); return; }
