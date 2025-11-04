@@ -7,6 +7,8 @@ idf_component_register(
     SRCS
         "main.cpp"
         "ads1115.cpp"
+        "variables.cpp"
+        "INA226.cpp"
     INCLUDE_DIRS
         "."
     REQUIRES
