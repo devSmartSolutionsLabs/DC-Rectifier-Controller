@@ -34,3 +34,18 @@ extern volatile uint64_t last_zc_rise_tick[3];
 extern volatile uint64_t last_zc_fall_tick[3];
 
 
+// ===================== Control de Corriente =====================
+extern volatile float corriente_objetivo;        // Corriente objetivo en A
+extern volatile float corriente_actual;          // Corriente medida en A
+extern volatile uint32_t delay_actual;   // Delay actual en us
+extern volatile bool control_corriente_activo;  // Modo de control
+extern volatile const float CORRIENTE_MAXIMA; // 5000A máximo
+extern volatile const float CORRIENTE_MINIMA;    // 0A mínimo
+
+// Parámetros del controlador
+extern volatile const uint32_t DELAY_MINIMO;      // us - mínimo delay seguro
+extern volatile const uint32_t DELAY_MAXIMO; // us - máximo delay
+extern volatile const uint32_t PASO_DELAY;          // us - paso de ajuste
+extern volatile const float UMBRAL_CORRIENTE;    // A - tolerancia
+
+extern volatile uint32_t MAX_DELAY_US;
