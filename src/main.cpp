@@ -37,7 +37,7 @@ static INA226* ina = nullptr;
 constexpr gpio_num_t I2C1_SDA_PIN = GPIO_NUM_43;
 constexpr gpio_num_t I2C1_SCL_PIN = GPIO_NUM_44;
 constexpr i2c_port_t I2C_PORT_1   = I2C_NUM_1;
-constexpr uint8_t    INA226_ADDR  = 0x45;   // detectada en tu scan
+constexpr uint8_t    INA226_ADDR  = 0x40;   // detectada en tu scan
 // ===================== Wi-Fi util =====================
 static EventGroupHandle_t s_wifi_eg = nullptr;
 #define WIFI_GOT_IP BIT0
@@ -101,7 +101,6 @@ constexpr int32_t  WORK_MIN      = 900;
 // (Opcional) debounce un poco más ajustado si tu ZC es limpio
 // constexpr uint32_t DEBOUNCE_TIME_US  = 400;
 
-constexpr uint32_t MAX_DELAY_US  = 8325;
 constexpr int32_t  STEP_COUNTS   = 70;
 constexpr uint32_t US_PER_STEP   = 1;
 
@@ -186,8 +185,7 @@ static DRAM_ATTR phase_config_t phases[NUM_PHASES] = {
 // Filtros
 static int32_t reading_buffer[FILTER_SIZE] = {0};
 static int     buffer_index  = 0;
-static float   voltage_buffer[FILTER_SIZE] = {0};
-static int     voltage_index = 0;
+
 
 // ======== Estado de relés y sistema (A0/A1/A2/A3) ========
 static bool a0_on = false;
@@ -210,9 +208,6 @@ static bool step2_done = false;
 static bool shutting_down = false;
 static uint64_t shutdown_deadline_ms = 0;
 
-// RMS (placeholder para futuro uso)
-static float    current_rms_voltage = 0.0f;
-static uint64_t last_rms_measurement = 0;
 static const uint64_t RMS_MEASUREMENT_INTERVAL = 500; // ms
 
 // Helpers tiempo
@@ -226,7 +221,7 @@ static bool  IRAM_ATTR scr_fire_timer_isr(gptimer_handle_t, const gptimer_alarm_
 bool     mcp23017_read_register_protected(uint8_t reg, uint8_t *value);
 bool     mcp23017_write_register_protected(uint8_t reg, uint8_t value);
 int32_t  ads1115_read_raw_protected();
-void     i2c_master_init();
+void     i2c_bus_init(i2c_port_t port, gpio_num_t sda_pin, gpio_num_t scl_pin, uint32_t clk_speed);
 void     init_mcp23017();
 void     initialize_phase(phase_config_t *phase, int timer_idx);
 static   void init_zc_timebase_1mhz();
@@ -294,7 +289,7 @@ bool mcp23017_read_register_protected(uint8_t reg, uint8_t *value){
         xSemaphoreGive(i2c_mutex);
         i2c_driver_delete(I2C_PORT);
         vTaskDelay(pdMS_TO_TICKS(100));
-        i2c_master_init();
+        i2c_bus_init(I2C_PORT, I2C_SDA_PIN, I2C_SCL_PIN, 100000);     // Puerto 0
         init_mcp23017();
         LOGW("I2C", "Bus recovery ejecutado");
     }
@@ -687,8 +682,68 @@ void dynamic_control_task(void*)
     }
 }
 
+float leer_corriente_actual() {
+    int32_t raw_value = ads1115_read_small_signal_49_protected();
+    
+    // Convertir lectura raw a voltaje (asumiendo ±256mV FSR)
+    float voltage_mv = ads1115_raw_to_mv(raw_value);
+    
+    // Aquí debes implementar la conversión de voltaje a corriente
+    // Esto depende de tu sensor de corriente. Ejemplo para shunt:
+    // float corriente = voltage_mv / (SHUNT_RESISTANCE * GAIN);
+    
+    // Por ahora, retornamos un valor simulado - REEMPLAZA ESTO:
+    float corriente = fabs(voltage_mv) * 10.0f; // Ejemplo: 10A por mV
+    
+    return corriente;
+}
+void actualizar_corriente_objetivo(int32_t valor_pot) {
+    // Mapear valor del potenciómetro a corriente objetivo (0-5000A)
+    valor_pot = clamp_ads(valor_pot);
+    
+    float rango = (float)(valor_pot - RAW_V_MIN) / (float)(RAW_V_MAX - RAW_V_MIN);
+    rango = fmaxf(0.0f, fminf(1.0f, rango)); // Clamp 0-1
+    
+    corriente_objetivo = CORRIENTE_MINIMA + (rango * CORRIENTE_MAXIMA);
+}
 
-
+void controlar_corriente() {
+    if (!control_corriente_activo || !scr_enabled) {
+        return;
+    }
+    
+    // Leer corriente actual
+    corriente_actual = leer_corriente_actual();
+    
+    // Calcular error
+    float error = corriente_objetivo - corriente_actual;
+    
+    // Si estamos por debajo de la corriente objetivo, reducir delay
+    if (error > UMBRAL_CORRIENTE) {
+        // Reducir delay para aumentar corriente
+        if (delay_actual > DELAY_MINIMO + PASO_DELAY) {
+            delay_actual -= PASO_DELAY;
+        } else {
+            delay_actual = DELAY_MINIMO;
+        }
+    }
+    // Si estamos por encima, aumentar delay
+    else if (error < -UMBRAL_CORRIENTE) {
+        // Aumentar delay para reducir corriente
+        if (delay_actual < DELAY_MAXIMO - PASO_DELAY) {
+            delay_actual += PASO_DELAY;
+        } else {
+            delay_actual = DELAY_MAXIMO;
+        }
+    }
+    
+    // Aplicar el nuevo delay a todas las fases activas
+    for (int i = 0; i < NUM_PHASES; i++) {
+        if (phases[i].enabled) {
+            phases[i].delay_us = delay_actual;
+        }
+    }
+}
 // Monitor: única tarea que imprime
 void system_health_monitor(void*)
 {
@@ -787,34 +842,56 @@ void initialize_phase(phase_config_t *phase, int timer_idx){
          (int)phase->zc_pin, (int)phase->output_pin, timer_idx);
 }
 
-// ===================== I2C init / Enables =====================
-void i2c_master_init(){
+// ===================== Funciones I2C que faltan =====================
+void i2c_bus_init(i2c_port_t port, gpio_num_t sda_pin, gpio_num_t scl_pin, uint32_t clk_speed) {
     i2c_config_t conf = {
         .mode = I2C_MODE_MASTER,
-        .sda_io_num = I2C_SDA_PIN,
-        .scl_io_num = I2C_SCL_PIN,
+        .sda_io_num = sda_pin,
+        .scl_io_num = scl_pin,
         .sda_pullup_en = GPIO_PULLUP_ENABLE,
         .scl_pullup_en = GPIO_PULLUP_ENABLE,
-        .master = { .clk_speed = 100000 },
+        .master = { .clk_speed = clk_speed },
         .clk_flags = 0
     };
-    ESP_ERROR_CHECK(i2c_param_config(I2C_PORT, &conf));
-    ESP_ERROR_CHECK(i2c_driver_install(I2C_PORT, conf.mode, 0, 0, 0));
-    LOGI("BOOT","I2C master SDA=%d SCL=%d", I2C_SDA_PIN, I2C_SCL_PIN);
+    
+    esp_err_t ret = i2c_param_config(port, &conf);
+    if (ret != ESP_OK) {
+        LOGE("I2C", "i2c_param_config failed: %d", ret);
+        return;
+    }
+    
+    ret = i2c_driver_install(port, conf.mode, 0, 0, 0);
+    if (ret != ESP_OK) {
+        LOGE("I2C", "i2c_driver_install failed: %d", ret);
+        return;
+    }
+    
+    LOGI("I2C", "Bus I2C inicializado: port=%d, SDA=%d, SCL=%d, speed=%lu", 
+         port, sda_pin, scl_pin, clk_speed);
 }
 
-void i2c1_master_init(){
-    i2c_config_t conf = {
-        .mode = I2C_MODE_MASTER,
-        .sda_io_num = I2C1_SDA_PIN,
-        .scl_io_num = I2C1_SCL_PIN,
-        .sda_pullup_en = GPIO_PULLUP_ENABLE,   // mejor tener pull-ups externos también
-        .scl_pullup_en = GPIO_PULLUP_ENABLE,
-        .master = { .clk_speed = 400000 },     // 100k si necesitas máxima robustez
-        .clk_flags = 0
-    };
-    ESP_ERROR_CHECK(i2c_param_config(I2C_PORT_1, &conf));
-    ESP_ERROR_CHECK(i2c_driver_install(I2C_PORT_1, conf.mode, 0, 0, 0));
+void i2c_scan_port(i2c_port_t port) {
+    printf("[I2C SCAN PORT %d] Iniciando escaneo...\n", port);
+    
+    int devices_found = 0;
+    for (uint8_t address = 0x03; address < 0x78; address++) {
+        i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+        i2c_master_start(cmd);
+        i2c_master_write_byte(cmd, (address << 1) | I2C_MASTER_WRITE, true);
+        i2c_master_stop(cmd);
+        
+        esp_err_t ret = i2c_master_cmd_begin(port, cmd, pdMS_TO_TICKS(50));
+        i2c_cmd_link_delete(cmd);
+        
+        if (ret == ESP_OK) {
+            printf("  - Dispositivo encontrado: 0x%02X\n", address);
+            devices_found++;
+        } else if (ret != ESP_ERR_TIMEOUT) {
+            // Opcional: mostrar otros errores
+        }
+    }
+    
+    printf("[I2C SCAN PORT %d] Escaneo completado. %d dispositivos encontrados.\n", port, devices_found);
 }
 
 void initialize_mcp_enables(){
@@ -855,10 +932,12 @@ extern "C" void app_main(void){
     
 
     initialize_mcp_enables();
-    i2c_master_init();
-    i2c1_master_init();
+    i2c_bus_init(I2C_PORT, I2C_SDA_PIN, I2C_SCL_PIN, 100000);     // Puerto 0
+    i2c_bus_init(I2C_PORT_1, I2C1_SDA_PIN, I2C1_SCL_PIN, 100000); // Puerto 1
 
-    i2c_scan(I2C_PORT_1);
+     // Escanear buses
+    i2c_scan_port(I2C_PORT);
+    i2c_scan_port(I2C_PORT_1);
 
     init_mcp23017();
 
