@@ -38,7 +38,7 @@ static constexpr uint32_t   I2C_HZ  = 400000;
 // === CONSTANTES GLOBALES DE MAPEO (Refactorizadas) ===
 static constexpr float MAX_CURRENT_A    = 5000.0f;      // Corriente máxima total
 static constexpr float CURRENT_STEP_A   = 5.0f;         // Paso de corriente deseado (5A)
-static constexpr float DELAY_STEP_US    = 4.0f;         // Paso de delay deseado (1.0 us/punto)
+static constexpr float DELAY_STEP_US    = 1.0f;         // Paso de delay deseado (1.0 us/punto)
 
 // Constantes Derivadas
 static constexpr float NUM_POINTS_F     = MAX_CURRENT_A / CURRENT_STEP_A; // 5000A / 5A = 1000.0f
