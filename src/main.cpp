@@ -1,986 +1,162 @@
-#include <cmath>
-#include <cstdio>
-#include <stdarg.h>
-#include <string.h>
-
+// main.cpp — ESP-IDF v5.5.1 — SCR gate desde ZC con GPTimer 1 MHz
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/semphr.h"
-#include "freertos/queue.h"
-#include "freertos/event_groups.h"
-
 #include "driver/gpio.h"
 #include "driver/gptimer.h"
-#include "driver/i2c.h"
-
 #include "esp_timer.h"
-#include "esp_intr_alloc.h"
-#include "esp_err.h"
-#include "esp_task_wdt.h"
 #include "esp_log.h"
 
-#include "esp_event.h"
-#include "esp_wifi.h"
-#include "esp_netif.h"
-#include "nvs_flash.h"
+static const char* TAG = "SCR";
 
-#include "http_ota.hpp"
-#include "ads1115.hpp"
-#include "variables.hpp"
-#include "INA226.hpp"
+// === Ajustes ===
+static constexpr uint32_t DELAY_US       = 4000;  // retardo desde ZC hasta flanco de gate
+static constexpr uint32_t PULSE_US       = 100;   // ancho del gate
+static constexpr uint32_t DEBOUNCE_US    = 200;   // anti-rebote ZC
+static constexpr int32_t  DELAY_TRIM_US  = -10;   // compensación de offset medido (+/- corrige)
 
-static ADS1115* adc0 = nullptr; // 0x48
-static ADS1115* adc1 = nullptr; // 0x49
+// Pines (tus asignaciones)
+static const gpio_num_t ZC_PIN[3]  = { GPIO_NUM_38, GPIO_NUM_21, GPIO_NUM_14 };
+static const gpio_num_t SCR_PIN[3] = { GPIO_NUM_48, GPIO_NUM_47, GPIO_NUM_13 };
 
-static INA226* ina = nullptr;
-
-constexpr gpio_num_t I2C1_SDA_PIN = GPIO_NUM_43;
-constexpr gpio_num_t I2C1_SCL_PIN = GPIO_NUM_44;
-constexpr i2c_port_t I2C_PORT_1   = I2C_NUM_1;
-constexpr uint8_t    INA226_ADDR  = 0x40;   // detectada en tu scan
-// ===================== Wi-Fi util =====================
-static EventGroupHandle_t s_wifi_eg = nullptr;
-#define WIFI_GOT_IP BIT0
-
-static void ip_event_handler(void*, esp_event_base_t base, int32_t id, void*){
-    if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) xEventGroupSetBits(s_wifi_eg, WIFI_GOT_IP);
-}
-
-static inline bool ok_or_known(esp_err_t e){ return e == ESP_OK || e == ESP_ERR_INVALID_STATE; }
-#define TRY_SKIP_INVALID(x) do { esp_err_t __e = (x); if (!ok_or_known(__e)) { printf(#x " -> err=%d\n", __e); return __e; } } while(0)
-
-static esp_err_t init_nvs(){
-    esp_err_t err = nvs_flash_init();
-    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        err = nvs_flash_init();
-    }
-    return err;
-}
-
-static esp_err_t wifi_init_sta_safe(const char* ssid, const char* pass){
-    TRY_SKIP_INVALID(init_nvs());
-    TRY_SKIP_INVALID(esp_netif_init());
-    esp_err_t err = esp_event_loop_create_default();
-    if (!ok_or_known(err)) return err;
-
-    esp_netif_t* netif = esp_netif_create_default_wifi_sta();
-    if (!netif) return ESP_FAIL;
-
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    TRY_SKIP_INVALID(esp_wifi_init(&cfg));
-
-    wifi_config_t wc = {};
-    strncpy((char*)wc.sta.ssid, ssid, sizeof(wc.sta.ssid));
-    strncpy((char*)wc.sta.password, pass, sizeof(wc.sta.password));
-    wc.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
-    wc.sta.sae_pwe_h2e = WPA3_SAE_PWE_BOTH;
-
-    TRY_SKIP_INVALID(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &ip_event_handler, nullptr));
-    TRY_SKIP_INVALID(esp_wifi_set_mode(WIFI_MODE_STA));
-    TRY_SKIP_INVALID(esp_wifi_set_config(WIFI_IF_STA, &wc));
-    TRY_SKIP_INVALID(esp_wifi_start());
-    TRY_SKIP_INVALID(esp_wifi_connect());
-
-    if (!s_wifi_eg) s_wifi_eg = xEventGroupCreate();
-    EventBits_t bits = xEventGroupWaitBits(s_wifi_eg, WIFI_GOT_IP, pdFALSE, pdFALSE, pdMS_TO_TICKS(8000));
-    return (bits & WIFI_GOT_IP) ? ESP_OK : ESP_ERR_TIMEOUT;
-}
-
-// Variables para medir ancho de pulso ZC
-static volatile uint64_t zc_rise_time[3] = {0,0,0};
-static volatile uint32_t zc_pulse_width[3] = {0,0,0};
-
-// ===================== Configuración general =====================
-constexpr uint32_t ZC_PULSE_WIDTH = 500;
-constexpr uint32_t ZC_PULSE_WIDTH_US = 500;
-constexpr uint32_t DEBOUNCE_TIME_US  = 1000;
-
-constexpr int32_t  WORK_MIN      = 900;
-
-// (Opcional) debounce un poco más ajustado si tu ZC es limpio
-// constexpr uint32_t DEBOUNCE_TIME_US  = 400;
-
-constexpr int32_t  STEP_COUNTS   = 70;
-constexpr uint32_t US_PER_STEP   = 1;
-
-constexpr gpio_num_t I2C_SDA_PIN = GPIO_NUM_5;
-constexpr gpio_num_t I2C_SCL_PIN = GPIO_NUM_4;
-constexpr i2c_port_t I2C_PORT    = I2C_NUM_0;
-
-constexpr uint8_t ADS1115_ADDR_1 = 0x48;
-constexpr uint8_t ADS1115_ADDR_2 = 0x49;
-constexpr uint8_t MCP23017_ADDR  = 0x27;
-
-// MCP23017
-constexpr uint8_t MCP23017_IODIRA = 0x00;
-constexpr uint8_t MCP23017_IODIRB = 0x01;
-constexpr uint8_t MCP23017_GPPUB  = 0x0D;
-constexpr uint8_t MCP23017_GPIOA  = 0x12;
-constexpr uint8_t MCP23017_GPIOB  = 0x13;
-
-// ADS1115
-constexpr uint8_t  ADS1115_REG_CONVERSION   = 0x00;
-constexpr uint8_t  ADS1115_REG_CONFIG       = 0x01;
-constexpr uint16_t ADS1115_CONFIG_START     = 0xC1C3;
-constexpr uint16_t ADS1115_CONFIG_DIFF_0_1  = 0xC283;
-
-#define FILTER_SIZE 8
-
-// ===================== Parámetros de pulsación =====================
-static const uint64_t STEP1_MS       = 2000;
-static const uint64_t STEP2_MS       = 3000;
-static const uint64_t MAX_GAP_TOL_MS = 800;
-static const uint64_t FAIL_DT_CAP_MS = 50;
-
-// ===================== Logger RAM =====================
-enum LogLevel : uint8_t { L_INFO=0, L_WARN=1, L_ERROR=2 };
-struct LogMsg { LogLevel level; const char* tag; char text[160]; };
-static QueueHandle_t log_q = nullptr;
-
-#define LOGI(TAG, FMT, ...) do { if (log_q){ LogMsg _m{L_INFO, TAG, {0}}; snprintf(_m.text, sizeof(_m.text), FMT, ##__VA_ARGS__); xQueueSend(log_q, &_m, 0);} } while(0)
-#define LOGW(TAG, FMT, ...) do { if (log_q){ LogMsg _m{L_WARN, TAG, {0}}; snprintf(_m.text, sizeof(_m.text), FMT, ##__VA_ARGS__); xQueueSend(log_q, &_m, 0);} } while(0)
-#define LOGE(TAG, FMT, ...) do { if (log_q){ LogMsg _m{L_ERROR, TAG, {0}}; snprintf(_m.text, sizeof(_m.text), FMT, ##__VA_ARGS__); xQueueSend(log_q, &_m, 0);} } while(0)
-
-static void logger_task(void*){
-    LogMsg m;
-    for(;;){ xQueueReceive(log_q, &m, portMAX_DELAY); /* hook opcional */ }
-}
-
-// ===================== Sincronización global =====================
-static SemaphoreHandle_t i2c_mutex   = NULL;
-static SemaphoreHandle_t system_mutex= NULL;
-
-// ===================== Timebase 1 MHz para debounce ZC =====================
-static gptimer_handle_t zc_timebase = NULL;
-static DRAM_ATTR volatile uint64_t last_zc_tick[3] = {0,0,0};
-
-// ===================== Fases y control =====================
+// Estado por fase
 typedef struct {
-    gpio_num_t zc_pin;
-    gpio_num_t output_pin;
-    volatile uint32_t delay_us;
-    volatile uint64_t last_zc_time;
-    gptimer_handle_t timer;
-    volatile bool enabled;
-    int phase_index;
-    volatile bool pulse_high;
-} phase_config_t;
+    gptimer_handle_t timer;          // temporizador libre a 1 MHz
+    int              idx;            // índice 0/1/2
+    volatile uint32_t last_rise_us;  // para debounce por soft (us)
+    volatile bool     next_is_high;  // alterna HIGH -> LOW dentro del ciclo
+} phase_t;
 
-#define NUM_PHASES 3
-constexpr int32_t RAW_V_MIN            = 700;
-constexpr int32_t RAW_V_MAX            = 20000;
-constexpr int32_t ONE_PHASE_THRESHOLD  = 12000;
-constexpr int32_t TWO_PHASE_THRESHOLD  = 18000;
+static phase_t ph[3];
 
-constexpr uint32_t ZC_MARGIN_US       = 150;
-constexpr uint32_t PULSE_WIDTH_US     = ZC_PULSE_WIDTH_US;
+// Helpers de tiempo
+static inline uint32_t now_us() { return (uint32_t)esp_timer_get_time(); }
 
-static DRAM_ATTR phase_config_t phases[NUM_PHASES] = {
-    { GPIO_NUM_38, GPIO_NUM_48, MAX_DELAY_US, 0, NULL, false, 0, false },
-    { GPIO_NUM_21, GPIO_NUM_47, MAX_DELAY_US, 0, NULL, false, 1, false },
-    { GPIO_NUM_14, GPIO_NUM_13, MAX_DELAY_US, 0, NULL, false, 2, false }
-};
-
-// Filtros
-static int32_t reading_buffer[FILTER_SIZE] = {0};
-static int     buffer_index  = 0;
-
-
-// ======== Estado de relés y sistema (A0/A1/A2/A3) ========
-static bool a0_on = false;
-static bool a1_on = false;
-static bool a2_on = false;
-static bool a3_on = false;
-
-static bool scr_enabled = false;
-
-// Botones y tiempos
-static uint64_t start_hold_ms = 0;
-static uint64_t gap_ms = 0;
-static bool last_b0 = false;
-static bool last_known_b0 = false;
-static bool last_known_b1 = false;
-static bool step1_done = false;
-static bool step2_done = false;
-
-// Apagado escalonado
-static bool shutting_down = false;
-static uint64_t shutdown_deadline_ms = 0;
-
-static const uint64_t RMS_MEASUREMENT_INTERVAL = 500; // ms
-
-// Helpers tiempo
-static inline uint64_t now_us(){ return (uint64_t)esp_timer_get_time(); }
-static inline uint64_t now_ms(){ return now_us() / 1000ULL; }
-
-// ===================== Forward decl =====================
-static void IRAM_ATTR zero_crossing_isr_handler(void* arg);
-static bool  IRAM_ATTR scr_fire_timer_isr(gptimer_handle_t, const gptimer_alarm_event_data_t*, void*);
-
-bool     mcp23017_read_register_protected(uint8_t reg, uint8_t *value);
-bool     mcp23017_write_register_protected(uint8_t reg, uint8_t value);
-int32_t  ads1115_read_raw_protected();
-void     i2c_bus_init(i2c_port_t port, gpio_num_t sda_pin, gpio_num_t scl_pin, uint32_t clk_speed);
-void     init_mcp23017();
-void     initialize_phase(phase_config_t *phase, int timer_idx);
-static   void init_zc_timebase_1mhz();
-
-// ===================== I2C base =====================
-bool mcp23017_write_register(uint8_t reg, uint8_t value){
-    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
-    i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (MCP23017_ADDR << 1) | I2C_MASTER_WRITE, true);
-    i2c_master_write_byte(cmd, reg, true);
-    i2c_master_write_byte(cmd, value, true);
-    i2c_master_stop(cmd);
-    esp_err_t ret = i2c_master_cmd_begin(I2C_PORT, cmd, pdMS_TO_TICKS(100));
-    i2c_cmd_link_delete(cmd);
-    if (ret != ESP_OK){ LOGE("I2C", "MCP W reg=0x%02X err=%d", reg, ret); return false; }
-    return true;
-}
-
-bool mcp23017_read_register(uint8_t reg, uint8_t *value){
-    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
-    i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (MCP23017_ADDR << 1) | I2C_MASTER_WRITE, true);
-    i2c_master_write_byte(cmd, reg, true);
-    i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (MCP23017_ADDR << 1) | I2C_MASTER_READ, true);
-    i2c_master_read_byte(cmd, value, I2C_MASTER_NACK);
-    i2c_master_stop(cmd);
-    esp_err_t ret = i2c_master_cmd_begin(I2C_PORT, cmd, pdMS_TO_TICKS(100));
-    i2c_cmd_link_delete(cmd);
-    if (ret != ESP_OK){ LOGE("I2C", "MCP R reg=0x%02X err=%d", reg, ret); return false; }
-    return true;
-}
-
-int32_t ads1115_read_raw(){
-    if (!adc0) return 0;
-    int16_t raw = 0;
-    bool ok = adc0->singleShot(
-        ADS1115::Mux::AIN0_GND,
-        ADS1115::PGA::FS_6V144,
-        ADS1115::DataRate::SPS_128,
-        raw
-    );
-    if (!ok) { LOGE("I2C","ADS(0x48) read fail"); return 0; }
-    return (int32_t)raw;
-}
-
-
-// ===================== Protegidas con mutex =====================
-bool mcp23017_write_register_protected(uint8_t reg, uint8_t value){
-    if (xSemaphoreTake(i2c_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        bool ok = mcp23017_write_register(reg, value);
-        xSemaphoreGive(i2c_mutex);
-        return ok;
-    }
-    LOGW("I2C", "Timeout MCP W reg=0x%02X", reg);
-    return false;
-}
-
-bool mcp23017_read_register_protected(uint8_t reg, uint8_t *value){
-    if (xSemaphoreTake(i2c_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        for (int retry = 0; retry < 3; retry++) {
-            if (mcp23017_read_register(reg, value)) { xSemaphoreGive(i2c_mutex); return true; }
-            vTaskDelay(pdMS_TO_TICKS(10));
-        }
-        xSemaphoreGive(i2c_mutex);
-        i2c_driver_delete(I2C_PORT);
-        vTaskDelay(pdMS_TO_TICKS(100));
-        i2c_bus_init(I2C_PORT, I2C_SDA_PIN, I2C_SCL_PIN, 100000);     // Puerto 0
-        init_mcp23017();
-        LOGW("I2C", "Bus recovery ejecutado");
-    }
-    return false;
-}
-
-int32_t ads1115_read_raw_protected(){
-    return ads1115_read_raw();
-}
-
-int32_t ads1115_read_small_signal_49() {
-    if (!adc1) return 0;
-    int16_t raw = 0;
-    bool ok = adc1->singleShot(
-        ADS1115::Mux::DIFF_0_1,
-        ADS1115::PGA::FS_0V256,
-        ADS1115::DataRate::SPS_16,
-        raw
-    );
-    if (!ok) return 0;
-
-    // Conversión a mV consistente con ±0.256 V
-    float voltage_mv = raw * (ADS1115::fsr_mV(ADS1115::PGA::FS_0V256) / 32768.0f);
-    printf("[ADS1115 0x49] Raw: %d, Voltage: %.3f mV\n", (int)raw, voltage_mv);
-    return (int32_t)raw;
-}
-
-// Función para convertir a milivoltios
-float ads1115_raw_to_mv(int32_t raw_value) {
-    // ±256mV FSR, 16 bits
-    // raw_value: -32768 to +32767
-    return (raw_value * 256.0f) / 32768.0f;
-}
-
-int32_t ads1115_read_small_signal_49_protected(){
-    return ads1115_read_small_signal_49();
-}
-
-
-// ===================== MCP y utilitarios =====================
-void init_mcp23017(){
-    mcp23017_write_register_protected(MCP23017_IODIRA, 0x00);
-    mcp23017_write_register_protected(MCP23017_IODIRB, 0x03);
-    mcp23017_write_register_protected(MCP23017_GPPUB,  0x03);
-    mcp23017_write_register_protected(MCP23017_GPIOA,  0x00);
-    LOGI("BOOT", "MCP23017 init A0..A3 out; B0,B1 in+pullup");
-}
-
-static inline void apply_relays(){
-    uint8_t relay_state = 0x00;
-    if (a0_on) relay_state |= 0x01;
-    if (a1_on) relay_state |= 0x02;
-    if (a2_on) relay_state |= 0x04;
-    if (a3_on) relay_state |= 0x08;
-    mcp23017_write_register_protected(MCP23017_GPIOA, relay_state);
-    LOGI("RELAYS","A0=%s A1=%s A2=%s A3=%s", a0_on?"ON":"OFF", a1_on?"ON":"OFF", a2_on?"ON":"OFF", a3_on?"ON":"OFF");
-}
-
-static inline void set_direction_from_b1_raw(bool b1_active_low){
-    a2_on = !b1_active_low;     // B1=0 -> A2 ON
-    a3_on = b1_active_low;    // B1=1 -> A3 ON
-}
-
-void update_phases_based_on_potentiometer(int32_t filtered_value){
-    if (!scr_enabled) { for (int i=0;i<NUM_PHASES;i++) phases[i].enabled = false; return; }
-
-    if (filtered_value <= RAW_V_MIN){
-        phases[0].enabled=false; phases[1].enabled=false; phases[2].enabled=false;
-        LOGI("MODE","0 ALL PHASES DISABLED");
-    } else if (filtered_value > RAW_V_MIN && filtered_value <= ONE_PHASE_THRESHOLD){
-        phases[0].enabled=true; phases[1].enabled=true; phases[2].enabled=true;
-        LOGI("MODE","1 fase (B) v=%ld", filtered_value);
-    } else if (filtered_value <= TWO_PHASE_THRESHOLD){
-        phases[0].enabled=true; phases[1].enabled=true; phases[2].enabled=true;
-        LOGI("MODE","2 fases (B,C) v=%ld", filtered_value);
-    } else {
-        phases[0].enabled=true; phases[1].enabled=true; phases[2].enabled=true;
-        LOGI("MODE","3 fases (A,B,C) v=%ld", filtered_value);
-    }
-}
-
-void read_buttons(){
-    static uint64_t last_ms = 0;
-    const uint64_t now = now_ms();
-    uint64_t dt = (last_ms==0)? 0 : (now - last_ms);
-    last_ms = now;
-
-    uint8_t pb = 0; bool ok = mcp23017_read_register_protected(MCP23017_GPIOB, &pb);
-
-    bool b0_active, b1_active_low;
-    if (ok){
-        b0_active     = !(pb & 0x01);
-        b1_active_low = !(pb & 0x02);
-        last_known_b0 = b0_active;
-        last_known_b1 = b1_active_low;
-    } else {
-        b0_active     = last_known_b0;
-        b1_active_low = last_known_b1;
-        if (dt > FAIL_DT_CAP_MS) dt = FAIL_DT_CAP_MS;
-    }
-
-    if (b0_active){
-        if (gap_ms <= MAX_GAP_TOL_MS) start_hold_ms += dt; else start_hold_ms = 0;
-        gap_ms = 0;
-    } else {
-        gap_ms += dt;
-        if (gap_ms > MAX_GAP_TOL_MS) start_hold_ms = 0;
-    }
-
-    if (b0_active && !last_b0) LOGI("BTN","START down");
-    if (!b0_active && last_b0) LOGI("BTN","START up");
-    last_b0 = b0_active;
-
-    if (!shutting_down){
-        if (!step1_done && start_hold_ms >= STEP1_MS){
-            a0_on = true; scr_enabled = true; a1_on = false; a2_on = false; a3_on = false;
-            step1_done = true;
-            LOGI("STATE","STEP1: A0 ON + SCR habilitados"); apply_relays();
-        }
-        if (!step2_done && start_hold_ms >= STEP2_MS){
-            a1_on = true; set_direction_from_b1_raw(b1_active_low); step2_done = true;
-            LOGI("STATE","STEP2: A1 ON + Dirección fijada"); apply_relays();
-        }
-    }
-
-    const bool any_on = (a0_on || a1_on || a2_on || a3_on || scr_enabled);
-    if (!b0_active && any_on && !shutting_down && gap_ms > MAX_GAP_TOL_MS){
-        a1_on = false; scr_enabled = false; a0_on = false;
-        for (int i=0;i<NUM_PHASES;i++){ phases[i].enabled=false; gpio_set_level(phases[i].output_pin,0); gptimer_stop(phases[i].timer); }
-        apply_relays();
-        LOGI("STATE","Apagado inmediato: A1 OFF + SCR OFF + A0 OFF");
-        shutting_down = true; shutdown_deadline_ms = now + 1000; start_hold_ms = 0;
-    }
-
-    if (shutting_down && now >= shutdown_deadline_ms){
-        a2_on = false; a3_on = false; apply_relays();
-        LOGI("STATE","Apagado final: A1 OFF y A2/A3 OFF");
-        shutting_down = false; step1_done = false; step2_done = false;
-    }
-}
-
-// ===================== Filtro =====================
-int32_t get_i2c_filtered_value(int32_t raw_value){
-    static bool init = false;
-    if (!init){ for (int i=0;i<FILTER_SIZE;i++) reading_buffer[i]=raw_value; buffer_index=0; init=true; }
-    reading_buffer[buffer_index] = raw_value;
-    buffer_index = (buffer_index + 1) % FILTER_SIZE;
-    int64_t sum = 0; for (int i=0;i<FILTER_SIZE;i++) sum += reading_buffer[i];
-    return (int32_t)(sum / FILTER_SIZE);
-}
-
-static inline int32_t clamp_ads(int32_t v){
-    if (v < RAW_V_MIN) return RAW_V_MIN;
-    if (v > RAW_V_MAX) return RAW_V_MAX;
-    return v;
-}
-
-// ===================== ISR SCR timer =====================
-static bool IRAM_ATTR scr_fire_timer_isr(gptimer_handle_t timer,
-                                         const gptimer_alarm_event_data_t*,
-                                         void *user_ctx)
+// ISR de alarma: genera el pulso (HIGH y luego LOW) en SCR_PIN[idx]
+static bool IRAM_ATTR on_alarm(gptimer_handle_t t,
+                               const gptimer_alarm_event_data_t* edata,
+                               void* user)
 {
-    phase_config_t *phase = (phase_config_t *)user_ctx;
+    phase_t* p = (phase_t*)user;
 
-    // Si deshabilitado, no dispares
-    if (!phase->enabled) {
-        gpio_set_level(phase->output_pin, 0);
-        gptimer_stop(timer);
-        phase->pulse_high = false;
-        return false;
-    }
+    if (p->next_is_high) {
+        // Subir gate
+        gpio_set_level(SCR_PIN[p->idx], 1);
 
-    // ONE-SHOT: subir a HIGH y detener el timer
-    gpio_set_level(phase->output_pin, 1);
-    phase->pulse_high = true;
-
-    // Timer ya cumplió su función, lo detenemos.
-    gptimer_stop(timer);
-    return false; // no rearmamos nada aquí
-}
-
-
-// ===================== ISR ZC =====================
-static void IRAM_ATTR zero_crossing_isr_handler(void* arg){
-    phase_config_t *phase = (phase_config_t *)arg;
-
-    // Tiempo base a 1 MHz (ya creada en init_zc_timebase_1mhz)
-    uint64_t now_tick = 0;
-    gptimer_get_raw_count(zc_timebase, &now_tick);
-
-    // Nivel actual del pin ZC para saber si es RISING (1) o FALLING (0)
-    const int level = gpio_get_level(phase->zc_pin);
-
-    if (level) {
-        // ---------- RISING EDGE ----------
-        // Debounce solo para rising
-        uint64_t last = last_zc_rise_tick[phase->phase_index];
-        if ((uint64_t)(now_tick - last) < (uint64_t)ZC_RISE_DEBOUNCE_US) return;
-        last_zc_rise_tick[phase->phase_index] = now_tick;
-
-        // Asegura que el gate esté en LOW al ZC
-        gpio_set_level(phase->output_pin, 0);
-        phase->pulse_high = false;
-
-        if (phase->enabled) {
-            // Calcula y limita el retardo desde tu ZC detectado
-            uint32_t d = phase->delay_us;
-#ifdef MAX_DELAY_FROM_ZC_US
-            if (d < MIN_DELAY_US)         d = MIN_DELAY_US;
-            if (d > MAX_DELAY_FROM_ZC_US) d = MAX_DELAY_FROM_ZC_US;
-#else
-            if (d < MIN_DELAY_US) d = MIN_DELAY_US;
-            if (d > MAX_DELAY_US) d = MAX_DELAY_US;
-#endif
-
-            // Cancela cualquier programación previa y arma ONE-SHOT para encender HIGH
-            gptimer_stop(phase->timer);
-
-            gptimer_alarm_config_t alarm = {
-                .alarm_count  = (uint64_t)d,
-                .reload_count = 0,
-                .flags = {0}
-            };
-            gptimer_set_alarm_action(phase->timer, &alarm);
-            gptimer_set_raw_count(phase->timer, 0);
-            gptimer_start(phase->timer);
-        } else {
-            // Si está deshabilitada la fase, garantiza timer parado y salida en LOW
-            gptimer_stop(phase->timer);
-        }
-
+        // Programar fin de pulso a +PULSE_US
+        gptimer_alarm_config_t a2 = {
+            .alarm_count  = edata->count_value + PULSE_US,
+            .reload_count = 0,
+            .flags = { .auto_reload_on_alarm = false }
+        };
+        gptimer_set_alarm_action(t, &a2);
+        p->next_is_high = false;
     } else {
-        // ---------- FALLING EDGE ----------
-        // Debounce solo para falling
-        uint64_t last = last_zc_fall_tick[phase->phase_index];
-        if ((uint64_t)(now_tick - last) < (uint64_t)ZC_FALL_DEBOUNCE_US) return;
-        last_zc_fall_tick[phase->phase_index] = now_tick;
-
-        // FALLING: apaga el gate y cancela el temporizador pendiente.
-        // Con esto, si el retardo 'd' era largo (p.ej. 7.8 ms), evitamos
-        // que el timer dispare el gate después del falling de este pulso ZC.
-        gpio_set_level(phase->output_pin, 0);
-        phase->pulse_high = false;
-        gptimer_stop(phase->timer);
+        // Bajar gate y mandar la siguiente alarma "lejos" (sin auto-reload)
+        gpio_set_level(SCR_PIN[p->idx], 0);
+        gptimer_alarm_config_t aclr = {
+            .alarm_count  = edata->count_value + 0x7FFFFFFF, // sin próximas
+            .reload_count = 0,
+            .flags = { .auto_reload_on_alarm = false }
+        };
+        gptimer_set_alarm_action(t, &aclr);
     }
-}
-static void i2c_scan(i2c_port_t port) {
-    printf("[I2C SCAN] start\n");
-    for (uint8_t addr = 0x03; addr < 0x78; addr++) {
-        i2c_cmd_handle_t cmd = i2c_cmd_link_create();
-        i2c_master_start(cmd);
-        i2c_master_write_byte(cmd, (addr << 1) | I2C_MASTER_WRITE, true);
-        i2c_master_stop(cmd);
-        esp_err_t err = i2c_master_cmd_begin(port, cmd, pdMS_TO_TICKS(50));
-        i2c_cmd_link_delete(cmd);
-        if (err == ESP_OK) {
-            printf("  - FOUND: 0x%02X\n", addr);
-        }
-    }
-    printf("[I2C SCAN] end\n");
+    return true; // ISR handled
 }
 
-static void ina226_debug_dump(INA226* ina) {
-    uint16_t cfg=0, mask=0, shunt=0, bus=0;
-    if (!ina) return;
-
-    bool ok_cfg  = ina->readReg16(INA226::REG_CONFIG, cfg);
-    bool ok_mask = ina->readReg16(INA226::REG_MASK_ENABLE, mask);
-    bool ok_sv   = ina->readReg16(INA226::REG_SHUNT_V, shunt);
-    bool ok_bv   = ina->readReg16(INA226::REG_BUS_V,   bus);
-
-    printf("[INA226 DUMP] ok_cfg=%d ok_mask=%d ok_sv=%d ok_bv=%d | "
-           "CFG=0x%04X MASK=0x%04X SHUNT=0x%04X BUS=0x%04X\n",
-           ok_cfg, ok_mask, ok_sv, ok_bv, cfg, mask, shunt, bus);
-
-    // Bits típicos a revisar en MASK/ENABLE (consulta tu datasheet exacto):
-    //  - CNVR (Conversion Ready)
-    //  - OVF  (Math Overflow)
-    bool cnvr = (mask & (1u<<3)) != 0;   // muchas variantes usan bit 3 para CNVR
-    bool ovf  = (mask & (1u<<0)) != 0;   // frecuentemente OVF en bit 0
-    printf("[INA226 DUMP] CNVR=%d OVF=%d\n", cnvr, ovf);
-}
-
-// ===================== Tareas =====================
-void button_control_task(void*){
-    esp_task_wdt_add(NULL);
-    const TickType_t period = pdMS_TO_TICKS(20);
-    for(;;){ esp_task_wdt_reset(); read_buttons(); vTaskDelay(period); }
-}
-
-void dynamic_control_task(void*)
+// ISR de ZC (solo flanco de subida): agenda el pulso a (DELAY_US + TRIM)
+static void IRAM_ATTR zc_isr(void* arg)
 {
-    esp_task_wdt_add(NULL);
+    const int idx = (int)(intptr_t)arg;
 
-    // (1) Seed del filtro del potenciómetro para evitar “saltos” al arranque
-    for (int i = 0; i < FILTER_SIZE; i++) {
-        reading_buffer[i] = ads1115_read_raw_protected();
-        vTaskDelay(pdMS_TO_TICKS(5));
-    }
+    // Debounce simple en us
+    uint32_t t = now_us();
+    uint32_t last = ph[idx].last_rise_us;
+    if ((uint32_t)(t - last) < DEBOUNCE_US) return;
+    ph[idx].last_rise_us = t;
 
-    // (2) Estado del EMA para INA226 (en float para suavizar; se publica en int32_t)
-    static float ema_bus_mV   = 0.0f;
-    static float ema_shunt_uV = 0.0f;
-    static bool  ema_init     = false;
+    // Fuerza gate en LOW al cruce por cero
+    gpio_set_level(SCR_PIN[idx], 0);
 
-    // Delay base (desde tu ZC detectado)
-    uint32_t new_delay_from_zc_us = (MIN_DELAY_US + MAX_DELAY_FROM_ZC_US) / 2;
+    // Lee contador del GPT de esta fase y programa la próxima alarma
+    uint64_t cur = 0;
+    gptimer_get_raw_count(ph[idx].timer, &cur);
 
-    for (;;) {
-        esp_task_wdt_reset();
+    int32_t eff_delay = (int32_t)DELAY_US + (int32_t)DELAY_TRIM_US;
+    if (eff_delay < 0) eff_delay = 0;
 
-        // ---------- POT (ADS1115) ----------
-        g_pot_raw = ads1115_read_raw_protected();
-        int32_t pot_filt = get_i2c_filtered_value(g_pot_raw);
-
-        if (pot_filt < POT_MIN_COUNTS) pot_filt = POT_MIN_COUNTS;
-        if (pot_filt > POT_MAX_COUNTS) pot_filt = POT_MAX_COUNTS;
-
-        // Map invertido: pot bajo -> delay alto
-        const int32_t  span_counts = (POT_MAX_COUNTS - POT_MIN_COUNTS);
-        const uint32_t span_delay  = (MAX_DELAY_FROM_ZC_US - MIN_DELAY_US);
-        uint32_t k = (span_counts > 0) ? (uint32_t)(pot_filt - POT_MIN_COUNTS) : 0;
-
-        uint32_t mapped = (span_counts > 0)
-                        ? (uint32_t)(((uint64_t)k * (uint64_t)span_delay) / (uint64_t)span_counts)
-                        : 0;
-
-        new_delay_from_zc_us = (MAX_DELAY_FROM_ZC_US > mapped)
-                             ? (MAX_DELAY_FROM_ZC_US - mapped)
-                             : MIN_DELAY_US;
-
-        if (new_delay_from_zc_us < MIN_DELAY_US)         new_delay_from_zc_us = MIN_DELAY_US;
-        if (new_delay_from_zc_us > MAX_DELAY_FROM_ZC_US) new_delay_from_zc_us = MAX_DELAY_FROM_ZC_US;
-
-        // ---------- INA226 (EMA > 1 ciclo 60 Hz) ----------
-        // Nota: El periodo de esta tarea define el dt del EMA
-        const float dt_ms   = (float)DYNAMIC_CTRL_PERIOD_MS;
-        float window_ms     = (float)INA_EMA_WINDOW_MS;
-        if (window_ms < dt_ms) window_ms = dt_ms;               // evitar alpha > 1
-        const float alpha   = dt_ms / window_ms;                 // 0 < alpha <= 1
-
-        int32_t bus_mV = 0;
-        int32_t shunt_uV = 0;
-
-        bool ok_bus = false;
-        bool ok_shunt = false;
-
-        if (ina && ina->waitConversionReady(30000)){
-            // Puedes habilitar el promedio interno del INA en begin(config) y aquí solo filtrar suave
-            // Si quieres asegurar muestra "nueva" de ambas rutas, configura el INA en SHUNT_BUS_CONT y AVG=N.
-            ok_bus   = ina->readBusVoltage_mV(bus_mV,     /*wait_ready=*/false);
-            ok_shunt = ina->readShuntMicroVolts(shunt_uV, /*wait_ready=*/false);
-
-            if (ok_bus && ok_shunt) {
-                if (!ema_init) {
-                    ema_bus_mV   = (float)bus_mV;
-                    ema_shunt_uV = (float)shunt_uV;
-                    ema_init     = true;
-                } else {
-                    ema_bus_mV   = ema_bus_mV   + alpha * ((float)bus_mV   - ema_bus_mV);
-                    ema_shunt_uV = ema_shunt_uV + alpha * ((float)shunt_uV - ema_shunt_uV);
-                }
-
-                // Publica valores “suavizados” para que los lea el HealthMonitor
-                g_ina_bus_mV_avg   = (int32_t)lrintf(ema_bus_mV);
-                g_ina_shunt_uV_avg = (int32_t)lrintf(ema_shunt_uV);
-                g_ina_ok       = true;
-            } else {
-                g_ina_ok = false;
-            }
-        } else {
-            g_ina_ok = false;
-        }
-
-        // ---------- Aplicar ángulo a las fases ----------
-        if (scr_enabled) {
-            for (int i = 0; i < NUM_PHASES; i++) {
-                phases[i].delay_us = new_delay_from_zc_us;
-            }
-            update_phases_based_on_potentiometer(pot_filt);
-        } else {
-            for (int i = 0; i < NUM_PHASES; i++) {
-                phases[i].enabled = false;
-                gpio_set_level(phases[i].output_pin, 0);
-                gptimer_stop(phases[i].timer);
-            }
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(DYNAMIC_CTRL_PERIOD_MS));
-    }
-}
-
-float leer_corriente_actual() {
-    int32_t raw_value = ads1115_read_small_signal_49_protected();
-    
-    // Convertir lectura raw a voltaje (asumiendo ±256mV FSR)
-    float voltage_mv = ads1115_raw_to_mv(raw_value);
-    
-    // Aquí debes implementar la conversión de voltaje a corriente
-    // Esto depende de tu sensor de corriente. Ejemplo para shunt:
-    // float corriente = voltage_mv / (SHUNT_RESISTANCE * GAIN);
-    
-    // Por ahora, retornamos un valor simulado - REEMPLAZA ESTO:
-    float corriente = fabs(voltage_mv) * 10.0f; // Ejemplo: 10A por mV
-    
-    return corriente;
-}
-void actualizar_corriente_objetivo(int32_t valor_pot) {
-    // Mapear valor del potenciómetro a corriente objetivo (0-5000A)
-    valor_pot = clamp_ads(valor_pot);
-    
-    float rango = (float)(valor_pot - RAW_V_MIN) / (float)(RAW_V_MAX - RAW_V_MIN);
-    rango = fmaxf(0.0f, fminf(1.0f, rango)); // Clamp 0-1
-    
-    corriente_objetivo = CORRIENTE_MINIMA + (rango * CORRIENTE_MAXIMA);
-}
-
-void controlar_corriente() {
-    if (!control_corriente_activo || !scr_enabled) {
-        return;
-    }
-    
-    // Leer corriente actual
-    corriente_actual = leer_corriente_actual();
-    
-    // Calcular error
-    float error = corriente_objetivo - corriente_actual;
-    
-    // Si estamos por debajo de la corriente objetivo, reducir delay
-    if (error > UMBRAL_CORRIENTE) {
-        // Reducir delay para aumentar corriente
-        if (delay_actual > DELAY_MINIMO + PASO_DELAY) {
-            delay_actual -= PASO_DELAY;
-        } else {
-            delay_actual = DELAY_MINIMO;
-        }
-    }
-    // Si estamos por encima, aumentar delay
-    else if (error < -UMBRAL_CORRIENTE) {
-        // Aumentar delay para reducir corriente
-        if (delay_actual < DELAY_MAXIMO - PASO_DELAY) {
-            delay_actual += PASO_DELAY;
-        } else {
-            delay_actual = DELAY_MAXIMO;
-        }
-    }
-    
-    // Aplicar el nuevo delay a todas las fases activas
-    for (int i = 0; i < NUM_PHASES; i++) {
-        if (phases[i].enabled) {
-            phases[i].delay_us = delay_actual;
-        }
-    }
-}
-// Monitor: única tarea que imprime
-void system_health_monitor(void*)
-{
-    printf("[HEALTH] Logger RAM activo. Sin persistencia.\n");
-    static uint32_t sample = 0;
-    for (;;) {
-        uint8_t pb = 0;
-        bool ok_btn = mcp23017_read_register_protected(MCP23017_GPIOB, &pb);
-        int b0 = ok_btn ? !(pb & 0x01) : -1;
-        int b1 = ok_btn ? !(pb & 0x02) : -1;
-
-        int32_t pot_raw  = g_pot_raw; // ya lo actualiza la tarea
-        int32_t pot_filt = get_i2c_filtered_value(pot_raw); // si quieres mostrar filtrado también
-
-        // Imprime los promedios del INA (sin spam en la tarea)
-        if (g_ina_ok) {
-            printf("[INA226 AVG] Bus=%ld mV  Shunt=%ld uV\n",
-                   (long)g_ina_bus_mV_avg, (long)g_ina_shunt_uV_avg);
-        } else {
-            printf("[INA226] sin dato válido\n");
-        }
-
-        printf("[HEALTH %lu] ok=%d rawB=0x%02X | B0=%d B1=%d | START=%d ENABLE=%d FORWARD=%d REVERSE=%d "
-               "| SCR=%d | POT_RAW=%ld POT_FILT=%ld | delayA=%lu delayB=%lu delayC=%lu\n",
-               (unsigned long)sample++,
-               (int)ok_btn, (unsigned)pb,
-               b0, b1,
-               (int)a0_on, (int)a1_on, (int)a2_on, (int)a3_on,
-               (int)scr_enabled,
-               (long)pot_raw, (long)pot_filt,
-               (unsigned long)phases[0].delay_us,
-               (unsigned long)phases[1].delay_us,
-               (unsigned long)phases[2].delay_us);
-
-        vTaskDelay(pdMS_TO_TICKS(1000));
-    }
-}
-
-
-// ===================== Timebase 1 MHz =====================
-static void init_zc_timebase_1mhz(){
-    gptimer_config_t cfg = {
-        .clk_src = GPTIMER_CLK_SRC_DEFAULT,
-        .direction = GPTIMER_COUNT_UP,
-        .resolution_hz = 1000000,
-        .intr_priority = 3,
-        .flags = { .intr_shared=false, .allow_pd=false, .backup_before_sleep=false }
+    gptimer_alarm_config_t a1 = {
+        .alarm_count  = cur + (uint32_t)eff_delay,
+        .reload_count = 0,
+        .flags = { .auto_reload_on_alarm = false }
     };
-    ESP_ERROR_CHECK(gptimer_new_timer(&cfg, &zc_timebase));
-    ESP_ERROR_CHECK(gptimer_enable(zc_timebase));
-    ESP_ERROR_CHECK(gptimer_start(zc_timebase));
+    gptimer_set_alarm_action(ph[idx].timer, &a1);
+    ph[idx].next_is_high = true;
 }
 
-// ===================== Inicialización de fase =====================
-void initialize_phase(phase_config_t *phase, int timer_idx){
-    gpio_config_t zc_config = {
-        .pin_bit_mask = (1ULL << phase->zc_pin),
+// Inicializa una fase: SCR salida, ZC entrada con interrupción, GPTimer 1 MHz libre
+static void init_phase(int i, gpio_num_t zc, gpio_num_t scr)
+{
+    // SCR como salida con pulldown (evita flancos espurios al boot)
+    gpio_config_t outc = {
+        .pin_bit_mask = 1ULL << scr,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_ENABLE,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+    ESP_ERROR_CHECK(gpio_config(&outc));
+    gpio_set_level(scr, 0);
+
+    // ZC como entrada + pullup + interrupción SOLO flanco de subida
+    gpio_config_t inc = {
+        .pin_bit_mask = 1ULL << zc,
         .mode = GPIO_MODE_INPUT,
-        .pull_up_en   = GPIO_PULLUP_ENABLE,    // típico con colector abierto a GND
+        .pull_up_en = GPIO_PULLUP_ENABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type    = GPIO_INTR_ANYEDGE      // <- ANTES era POSEDGE
+        .intr_type = GPIO_INTR_POSEDGE
     };
-    gpio_config(&zc_config);
+    ESP_ERROR_CHECK(gpio_config(&inc));
 
-
-
-    gpio_config_t output_config = {
-        .pin_bit_mask = (1ULL << phase->output_pin),
-        .mode = GPIO_MODE_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE
+    // GPTimer 1 MHz, libre y corriendo siempre (menor jitter)
+    gptimer_config_t tc = {
+        .clk_src       = GPTIMER_CLK_SRC_DEFAULT,
+        .direction     = GPTIMER_COUNT_UP,
+        .resolution_hz = 1000000, // 1 tick = 1 us
+        .intr_priority = 1
     };
-    gpio_config(&output_config);
-    gpio_set_level(phase->output_pin, 0);
+    ESP_ERROR_CHECK(gptimer_new_timer(&tc, &ph[i].timer));
+    gptimer_event_callbacks_t cbs = { .on_alarm = on_alarm };
+    ESP_ERROR_CHECK(gptimer_register_event_callbacks(ph[i].timer, &cbs, &ph[i]));
+    ESP_ERROR_CHECK(gptimer_enable(ph[i].timer));
+    ESP_ERROR_CHECK(gptimer_start(ph[i].timer)); // siempre ON
 
-    gptimer_config_t timer_config = {
-        .clk_src = GPTIMER_CLK_SRC_DEFAULT,
-        .direction = GPTIMER_COUNT_UP,
-        .resolution_hz = 1000000,
-        .intr_priority = 2,
-        .flags = { .intr_shared=false, .allow_pd=false, .backup_before_sleep=false }
-    };
-    ESP_ERROR_CHECK(gptimer_new_timer(&timer_config, &phase->timer));
-    gptimer_event_callbacks_t cbs = { .on_alarm = scr_fire_timer_isr };
-    ESP_ERROR_CHECK(gptimer_register_event_callbacks(phase->timer, &cbs, phase));
-    ESP_ERROR_CHECK(gptimer_enable(phase->timer));
+    ph[i].idx = i;
+    ph[i].last_rise_us = 0;
+    ph[i].next_is_high = false;
 
-    phase->phase_index = timer_idx;
-    phase->pulse_high = false;
+    // Instala servicio de ISR GPIO una sola vez
+    static bool isr_installed = false;
+    if (!isr_installed) {
+        esp_err_t gi = gpio_install_isr_service(ESP_INTR_FLAG_IRAM);
+        if (gi != ESP_OK && gi != ESP_ERR_INVALID_STATE) ESP_ERROR_CHECK(gi);
+        isr_installed = true;
+    }
+    ESP_ERROR_CHECK(gpio_isr_handler_add(zc, zc_isr, (void*)(intptr_t)i));
 
-    gpio_isr_handler_add(phase->zc_pin, zero_crossing_isr_handler, (void*)phase);
-
-    LOGI("BOOT","Fase %c ZC=%d SCR=%d timer=%d",
-         (phase==&phases[0]?'A':(phase==&phases[1]?'B':'C')),
-         (int)phase->zc_pin, (int)phase->output_pin, timer_idx);
+    ESP_LOGI(TAG, "Fase %d lista: ZC=%d SCR=%d", i, (int)zc, (int)scr);
 }
 
-// ===================== Funciones I2C que faltan =====================
-void i2c_bus_init(i2c_port_t port, gpio_num_t sda_pin, gpio_num_t scl_pin, uint32_t clk_speed) {
-    i2c_config_t conf = {
-        .mode = I2C_MODE_MASTER,
-        .sda_io_num = sda_pin,
-        .scl_io_num = scl_pin,
-        .sda_pullup_en = GPIO_PULLUP_ENABLE,
-        .scl_pullup_en = GPIO_PULLUP_ENABLE,
-        .master = { .clk_speed = clk_speed },
-        .clk_flags = 0
-    };
-    
-    esp_err_t ret = i2c_param_config(port, &conf);
-    if (ret != ESP_OK) {
-        LOGE("I2C", "i2c_param_config failed: %d", ret);
-        return;
-    }
-    
-    ret = i2c_driver_install(port, conf.mode, 0, 0, 0);
-    if (ret != ESP_OK) {
-        LOGE("I2C", "i2c_driver_install failed: %d", ret);
-        return;
-    }
-    
-    LOGI("I2C", "Bus I2C inicializado: port=%d, SDA=%d, SCL=%d, speed=%lu", 
-         port, sda_pin, scl_pin, clk_speed);
-}
+extern "C" void app_main(void)
+{
+    esp_log_level_set("*", ESP_LOG_INFO);
 
-void i2c_scan_port(i2c_port_t port) {
-    printf("[I2C SCAN PORT %d] Iniciando escaneo...\n", port);
-    
-    int devices_found = 0;
-    for (uint8_t address = 0x03; address < 0x78; address++) {
-        i2c_cmd_handle_t cmd = i2c_cmd_link_create();
-        i2c_master_start(cmd);
-        i2c_master_write_byte(cmd, (address << 1) | I2C_MASTER_WRITE, true);
-        i2c_master_stop(cmd);
-        
-        esp_err_t ret = i2c_master_cmd_begin(port, cmd, pdMS_TO_TICKS(50));
-        i2c_cmd_link_delete(cmd);
-        
-        if (ret == ESP_OK) {
-            printf("  - Dispositivo encontrado: 0x%02X\n", address);
-            devices_found++;
-        } else if (ret != ESP_ERR_TIMEOUT) {
-            // Opcional: mostrar otros errores
-        }
-    }
-    
-    printf("[I2C SCAN PORT %d] Escaneo completado. %d dispositivos encontrados.\n", port, devices_found);
-}
+    for (int i = 0; i < 3; ++i) init_phase(i, ZC_PIN[i], SCR_PIN[i]);
 
-void initialize_mcp_enables(){
-    const gpio_num_t pin_15 = GPIO_NUM_15;
-    const gpio_num_t pin_41 = GPIO_NUM_41;
+    ESP_LOGI(TAG, "DELAY=%lu us  PULSE=%lu us  TRIM=%ld us  => efectivo ≈ %ld us",
+             (unsigned long)DELAY_US,
+             (unsigned long)PULSE_US,
+             (long)DELAY_TRIM_US,
+             (long)((int32_t)DELAY_US + (int32_t)DELAY_TRIM_US));
 
-    gpio_config_t io_config = {
-        .pin_bit_mask = (1ULL << pin_15) | (1ULL << pin_41),
-        .mode = GPIO_MODE_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE
-    };
-    gpio_config(&io_config);
-
-    gpio_set_level(pin_15, 1);
-    gpio_set_level(pin_41, 1);
-    LOGI("BOOT","Enables MCP: GPIO15=1 GPIO41=1");
-}
-
-// ===================== app_main =====================
-extern "C" void app_main(void){
-    esp_log_level_set("*", ESP_LOG_WARN);
-
-    // WDT
-    esp_task_wdt_config_t twdt_config = { .timeout_ms = 60000, .idle_core_mask = 0, .trigger_panic = true };
-    esp_task_wdt_init(&twdt_config);
-
-    // Logger RAM
-    log_q = xQueueCreate(64, sizeof(LogMsg));
-    xTaskCreate(logger_task, "Logger", 4096, NULL, 2, NULL);
-
-    // Mutex
-    i2c_mutex    = xSemaphoreCreateMutex();
-    system_mutex = xSemaphoreCreateMutex();
-    if (i2c_mutex == NULL || system_mutex == NULL) { printf("[HEALTH] ERROR creando mutex\n"); return; }
-
-    
-
-    initialize_mcp_enables();
-    i2c_bus_init(I2C_PORT, I2C_SDA_PIN, I2C_SCL_PIN, 100000);     // Puerto 0
-    i2c_bus_init(I2C_PORT_1, I2C1_SDA_PIN, I2C1_SCL_PIN, 100000); // Puerto 1
-
-     // Escanear buses
-    i2c_scan_port(I2C_PORT);
-    i2c_scan_port(I2C_PORT_1);
-
-    init_mcp23017();
-
-
-    adc0 = new ADS1115(I2C_PORT, ADS1115_ADDR_1, i2c_mutex);
-    adc1 = new ADS1115(I2C_PORT, ADS1115_ADDR_2, i2c_mutex);
-    adc0->begin();
-    adc1->begin();
-
-    ina = new INA226(I2C_PORT_1, INA226_ADDR, i2c_mutex);
-    if (!ina->begin(INA226::Avg::AVG_128,
-                    INA226::Ct::CT_588us,
-                    INA226::Ct::CT_588us,
-                    INA226::Mode::SHUNT_BUS_CONT)) {
-        printf("[INA226] begin() FAIL\n");
-    }
-
-    if (!g_ina_ok) {
-        printf("[INA226] begin() fallo. Revisa direccion y cableado.\n");
-    }
-
-    esp_err_t gi = gpio_install_isr_service(ESP_INTR_FLAG_IRAM | ESP_INTR_FLAG_LEVEL3);
-    if (gi != ESP_OK && gi != ESP_ERR_INVALID_STATE) { printf("GPIO ISR err=%d\n", gi); return; }
-    init_zc_timebase_1mhz();
-
-    initialize_phase(&phases[0], 0);
-    initialize_phase(&phases[1], 1);
-    initialize_phase(&phases[2], 2);
-
-    xTaskCreate(dynamic_control_task, "DynamicControl", 8192, NULL, 5, NULL);
-    xTaskCreate(button_control_task,  "ButtonControl",  6144, NULL, 6, NULL);
-    xTaskCreate(system_health_monitor,"HealthMonitor",  4096, NULL, 1, NULL);
-
-    esp_task_wdt_add(NULL);
-
-    // === Wi-Fi y OTA por navegador ===
-    //esp_err_t w = wifi_init_sta_safe("SmartLabs", "20120415H");
-    //if (w != ESP_OK){
-    //    printf("[OTA] WiFi no disponible, err=%d\n", w);
-    //} else {
-        //esp_err_t h = http_ota_start(80);
-        //if (h != ESP_OK) printf("[OTA] HTTP OTA fallo: %d\n", h);
-    //}
-
-    for(;;){ esp_task_wdt_reset(); vTaskDelay(pdMS_TO_TICKS(1000)); }
+    while (true) vTaskDelay(pdMS_TO_TICKS(1000));
 }

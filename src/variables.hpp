@@ -2,11 +2,11 @@
 #include <stdint.h>
 
 // ================== Constantes de tiempo (compartidas) ==================
-constexpr uint32_t HALF_PERIOD_US      = 8333;   // 60 Hz
-constexpr uint32_t ZC_DETECT_OFFSET    = 50;     // tu detección llega ~50 us tarde
+constexpr uint32_t HALF_PERIOD_US      = 8315;   // 60 Hz
+constexpr uint32_t ZC_DETECT_OFFSET    = 0;     // tu detección llega ~50 us tarde
 constexpr uint32_t MAX_DELAY_FROM_ZC_US= HALF_PERIOD_US - ZC_DETECT_OFFSET;
 
-constexpr uint32_t WORKING_TIME        = 6000;   // ventana útil después del ZC
+constexpr uint32_t WORKING_TIME        = 1000;   // ventana útil después del ZC
 constexpr uint32_t MIN_DELAY_US        = MAX_DELAY_FROM_ZC_US - WORKING_TIME;
 
 static_assert(MIN_DELAY_US < MAX_DELAY_FROM_ZC_US, "MIN must be < MAX");

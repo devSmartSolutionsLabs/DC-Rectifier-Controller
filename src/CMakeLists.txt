@@ -1,6 +1,6 @@
 # This file was automatically generated for projects
 # without default 'CMakeLists.txt' file.
-
+set(IDF_TARGET esp32s3)
 FILE(GLOB_RECURSE app_sources ${CMAKE_SOURCE_DIR}/src/*.*)
 
 idf_component_register(
@@ -9,6 +9,9 @@ idf_component_register(
         "ads1115.cpp"
         "variables.cpp"
         "INA226.cpp"
+        "SerialConsole.cpp"
+        "webOTAServer.cpp"
+        "WiFiHelper.cpp"
     INCLUDE_DIRS
         "."
     REQUIRES
