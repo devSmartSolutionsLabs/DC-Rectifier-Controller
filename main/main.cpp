@@ -18,8 +18,8 @@
 static const char* TAG = "RECTIFICADOR";
 
 // === Configuración SCR ===
-static constexpr uint32_t PULSE_US       = 500;     // ANCHO DEL PULSO: 50 us
-static constexpr uint32_t DEBOUNCE_US    = 200;    // anti-rebote ZC
+static constexpr uint32_t PULSE_US       = 50;     // RESTAURADO: Ancho fijo del pulso de disparo (50 us)
+static constexpr uint32_t DEBOUNCE_US    = 200;    // Restaurado a 200 us.
 static constexpr uint32_t DEFAULT_SEMI_PERIOD_US = 8333; // 60Hz
 
 // Pines 
@@ -38,25 +38,23 @@ static constexpr uint32_t   I2C_HZ  = 400000;
 // === CONSTANTES GLOBALES DE MAPEO (Refactorizadas) ===
 static constexpr float MAX_CURRENT_A    = 5000.0f;      // Corriente máxima total
 static constexpr float CURRENT_STEP_A   = 5.0f;         // Paso de corriente deseado (5A)
-static constexpr float DELAY_STEP_US    = 1.0f;         // Paso de delay deseado (1.0 us/punto)
+static constexpr float DELAY_STEP_US    = 1.0f;         // Paso de delay deseado (4.0 us/punto)
 
 // Constantes Derivadas
 static constexpr float NUM_POINTS_F     = MAX_CURRENT_A / CURRENT_STEP_A; // 5000A / 5A = 1000.0f
-static constexpr float DELAY_RANGE_US_F = NUM_POINTS_F * DELAY_STEP_US;   // 1000.0f * 1.0f = 1000.0f
+static constexpr float DELAY_RANGE_US_F = NUM_POINTS_F * DELAY_STEP_US;   // 1000.0f * 4.0f = 4000.0f
 
 // Límites de Potenciómetro
-static constexpr float POT_MIN_MV       = 400.0f;  // NUEVO: Mínimo mapeado
-static constexpr float POT_MAX_MV       = 4000.0f;  // NUEVO: Máximo mapeado
-static constexpr float MV_RANGE         = POT_MAX_MV - POT_MIN_MV; // 2000 mV de rango útil
+static constexpr float POT_MIN_MV       = 400.0f;  // Mínimo mapeado
+static constexpr float POT_MAX_MV       = 4000.0f;  // Máximo mapeado
+static constexpr float MV_RANGE         = POT_MAX_MV - POT_MIN_MV; 
 
 // Nuevo límite superior de seguridad
 static constexpr uint32_t SAFE_MAX_DELAY_US = 8320; // Hard cap para el delay máximo (seguridad)
 
-// === LÍMITES DE VALIDACIÓN DE FRECUENCIA (NUEVOS) ===
-// 60.5 Hz (Período más corto)
-static constexpr uint32_t MIN_PERIOD_VALID_US = 8264; 
-// 59.5 Hz (Período más largo)
-static constexpr uint32_t MAX_PERIOD_VALID_US = 8404;
+// === LÍMITES DE VALIDACIÓN DE FRECUENCIA ===
+static constexpr uint32_t MIN_PERIOD_VALID_US = 8264; // 60.5 Hz (Período más corto)
+static constexpr uint32_t MAX_PERIOD_VALID_US = 8404; // 59.5 Hz (Período más largo)
 // ===================================================
 
 // El DELAY MAX y MIN AHORA SERÁN CALCULADOS DINÁMICAMENTE.
@@ -71,8 +69,7 @@ static volatile uint32_t g_pulse_count[3] = {0, 0, 0};
 static volatile float g_pot_mv = 0.0f; // Almacena el último valor del potenciómetro
 
 // === Variables de Medición de Periodo Adaptativo (MÍNIMO HISTÓRICO) ===
-// Inicializado a un valor alto para que la primera medición válida lo reemplace.
-static volatile uint32_t g_semi_period_measured_us = 8400; 
+static volatile uint32_t g_semi_period_measured_us = 8600; 
 // =====================================================================
 
 // === Estados del Sistema ===
@@ -217,7 +214,7 @@ static void update_potentiometer() {
     for (int i = 0; i < NUM_SAMPLES; ++i) {
         if (g_ads->singleShotMV(ADS1115::Mux::DIFF_0_1,
                                ADS1115::PGA::FS_6V144,
-                               ADS1115::DataRate::SPS_64, 
+                               ADS1115::DataRate::SPS_64,
                                samples[i])) {
             // SPS_64 toma ~15ms por muestra
         } else {
@@ -258,11 +255,10 @@ static void update_potentiometer() {
     // === LÓGICA DE MAPEO ADAPTATIVO Y SEGURO (MÍNIMO HISTÓRICO) ===
     
     // 1. Obtener el Mínimo Histórico del Semi-Período
-    // dynamic_semi_period es ahora el mínimo absoluto visto hasta el momento.
     uint32_t dynamic_semi_period = g_semi_period_measured_us; 
     
+    // Aplicamos límites de validación de frecuencia para el fallback
     if (dynamic_semi_period < MIN_PERIOD_VALID_US || dynamic_semi_period > MAX_PERIOD_VALID_US) { 
-        // Si el MÍNIMO HISTÓRICO es inválido, usar el valor de seguridad por defecto.
         dynamic_semi_period = DEFAULT_SEMI_PERIOD_US;
     }
 
@@ -285,8 +281,6 @@ static void update_potentiometer() {
     if (mv > POT_MAX_MV) mv = POT_MAX_MV;
     
     // 3. Normalizar el voltaje al rango [0, 1]
-    // Si mv es POT_MIN_MV (2000 mV), normalized = 0
-    // Si mv es POT_MAX_MV (4000 mV), normalized = 1
     float normalized = (mv - POT_MIN_MV) / MV_RANGE;
     
     // 4. Convertir a Punto Discreto (P de 0 a 999)
@@ -298,7 +292,6 @@ static void update_potentiometer() {
     }
     
     // 5. Mapeo Invertido y Discreto a Delay (usando el dynamic_delay_max capado)
-    // new_delay = DELAY_MAX_US - (current_point * DELAY_STEP_US)
     uint32_t new_delay = (uint32_t)(dynamic_delay_max - ((float)current_point * DELAY_STEP_US));
     
     // 6. Asegurar límites finales
@@ -337,26 +330,29 @@ static bool IRAM_ATTR on_alarm(gptimer_handle_t timer,
         // Disparo del Pulso (HIGH)
         gpio_set_level(SCR_PIN[p->idx], 1);
         
-        // ******* PULSO SOSTENIDO: NO SE REPROGRAMA EL APAGADO *******
-        // La alarma sonó (t = Delay). El pulso comienza y se mantendrá HIGH.
-        p->next_is_high = false; 
-    } else {
-        // Esta sección NO DEBERÍA ejecutarse en modo pulso sostenido.
+        // ******* REPROGRAMACIÓN CLAVE: PULSO DE ANCHO FIJO (50 us) *******
+        // Programar la alarma para apagar el pulso después de PULSE_US
+        gptimer_alarm_config_t alarm_config = {
+            .alarm_count = edata->alarm_value + PULSE_US,
+            .reload_count = 0,
+            .flags = {
+                .auto_reload_on_alarm = false
+            }
+        };
+        gptimer_set_alarm_action(p->timer, &alarm_config);
+        p->next_is_high = false; // El próximo evento apaga el pulso
         
-        // Apagado del Pulso (LOW)
+    } else {
+        // Apagado del Pulso (LOW) - Activado por la alarma de 50 us
         gpio_set_level(SCR_PIN[p->idx], 0); 
         
-        // Deshabilitar futuras alarmas
+        // Deshabilitar futuras alarmas (hasta el próximo ZC)
         gptimer_alarm_config_t alarm_config = {
             .alarm_count = edata->alarm_value + 0x7FFFFFFF,
             .reload_count = 0,
             .flags = { .auto_reload_on_alarm = false }
         };
         gptimer_set_alarm_action(p->timer, &alarm_config);
-        
-        // Incrementar contador de pulsos
-        uint32_t temp = g_pulse_count[p->idx];
-        g_pulse_count[p->idx] = temp + 1;
     }
     return true;
 }
@@ -411,13 +407,14 @@ static void IRAM_ATTR zc_isr(void* arg) {
     // *** Lógica Unificada para programar el Pulso en CADA ZC ***
     
     // 1. APAGADO FÍSICO INMEDIATO Y CANCELACIÓN DE ALARMA PENDIENTE
-    gpio_set_level(SCR_PIN[idx], 0); // <--- ESTO APAGA EL PULSO SOSTENIDO DEL SEMICICLO ANTERIOR
+    // ESTA ES LA SEGURIDAD ZC: APAGA CUALQUIER PULSO ACTIVO (ya sea sostenido o fijo de 50us)
+    gpio_set_level(SCR_PIN[idx], 0); 
     
     // CORRECCIÓN CLAVE 2: AUMENTAR EL CONTADOR DE PULSOS AQUÍ (Semiciclo ZC Procesado)
     uint32_t temp = g_pulse_count[idx];
     g_pulse_count[idx] = temp + 1;
     
-    // Detener el timer cancela cualquier alarma de disparo que pudiera estar pendiente.
+    // Detener el timer cancela cualquier alarma de disparo o apagado que pudiera estar pendiente.
     gptimer_stop(p->timer);
     
     // 2. Reiniciar Timer para contar el retardo desde el ZC
@@ -432,20 +429,20 @@ static void IRAM_ATTR zc_isr(void* arg) {
         return; 
     }
     
-    // 3. Programar alarma para DISPARO (el pulso se mantendrá HIGH hasta el próximo ZC)
+    // 3. Programar alarma para DISPARO (que activará la alarma de apagado de 50 us en on_alarm)
     gptimer_alarm_config_t alarm_config = {
         .alarm_count = (uint64_t)delay, // El contador inicia en 0, la alarma es el delay
         .reload_count = 0,
         .flags = { .auto_reload_on_alarm = false }
     };
     gptimer_set_alarm_action(p->timer, &alarm_config);
-    p->next_is_high = true; // El próximo evento del timer es HIGH (el inicio del pulso sostenido)
+    p->next_is_high = true; // El próximo evento del timer es HIGH (el inicio del pulso)
 }
 
 // === Tareas ===
 static void button_task(void* arg) {
     // LLAMADA UNICA: Suscribir la tarea al WDT
-    ESP_ERROR_CHECK(esp_task_wdt_add(NULL)); 
+    ESP_ERROR_ERROR_CHECK(esp_task_wdt_add(NULL)); 
     ESP_LOGI(TAG, "Tarea botones iniciada");
     
     for (;;) {
@@ -593,7 +590,6 @@ static void init_phase(int i, gpio_num_t zc, gpio_num_t scr) {
     ph[i].last_fall_us = 0;
     ph[i].next_is_high = false;
     ph[i].enabled = false;
-    //ph[i].timer = 100;
 
     static bool isr_installed = false;
     if (!isr_installed) {
