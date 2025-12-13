@@ -141,6 +141,6 @@ bool ADS1115::readContinuous(int16_t& raw){
 
 bool ADS1115::stopContinuous(){
     // Pasar a single-shot sin iniciar conversión
-    uint16_t cfg = makeConfig(Mux::AIN0_GND, PGA::FS_2V048, DataRate::SPS_128, Mode::SINGLE_SHOT, false);
+    uint16_t cfg = makeConfig(Mux::AIN0_GND, PGA::FS_6V144, DataRate::SPS_128, Mode::SINGLE_SHOT, false);
     return writeConfig(cfg);
 }

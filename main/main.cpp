@@ -18,8 +18,8 @@
 static const char* TAG = "RECTIFICADOR";
 
 // === Configuración SCR ===
-static constexpr uint32_t PULSE_US       = 700;     // RESTAURADO: Ancho fijo del pulso de disparo (50 us)
-static constexpr uint32_t DEBOUNCE_US    = 2500;    // Restaurado a 200 us.
+static constexpr uint32_t PULSE_US       = 700;     // ANCHO DEL PULSO: 700 us
+static constexpr uint32_t DEBOUNCE_US    = 2500;    // anti-rebote ZC (2.5 ms)
 static constexpr uint32_t DEFAULT_SEMI_PERIOD_US = 8333; // 60Hz
 
 // Pines 
@@ -38,15 +38,15 @@ static constexpr uint32_t   I2C_HZ  = 400000;
 // === CONSTANTES GLOBALES DE MAPEO (Refactorizadas) ===
 static constexpr float MAX_CURRENT_A    = 5000.0f;      // Corriente máxima total
 static constexpr float CURRENT_STEP_A   = 5.0f;         // Paso de corriente deseado (5A)
-static constexpr float DELAY_STEP_US    = 6.0f;         // Paso de delay deseado (4.0 us/punto)
+static constexpr float DELAY_STEP_US    = 5.75f;         // Paso de delay deseado (6.0 us/punto)
 
 // Constantes Derivadas
 static constexpr float NUM_POINTS_F     = MAX_CURRENT_A / CURRENT_STEP_A; // 5000A / 5A = 1000.0f
-static constexpr float DELAY_RANGE_US_F = NUM_POINTS_F * DELAY_STEP_US;   // 1000.0f * 4.0f = 4000.0f
+static constexpr float DELAY_RANGE_US_F = NUM_POINTS_F * DELAY_STEP_US;   // 1000.0f * 6.0f = 6000.0f
 
 // Límites de Potenciómetro
-static constexpr float POT_MIN_MV       = 400.0f;  // Mínimo mapeado
-static constexpr float POT_MAX_MV       = 4000.0f;  // Máximo mapeado
+static constexpr float POT_MIN_MV       = 200.0f;  // Mínimo mapeado
+static constexpr float POT_MAX_MV       = 4100.0f;  // Máximo mapeado
 static constexpr float MV_RANGE         = POT_MAX_MV - POT_MIN_MV; 
 
 // Nuevo límite superior de seguridad
@@ -69,7 +69,7 @@ static volatile uint32_t g_pulse_count[3] = {0, 0, 0};
 static volatile float g_pot_mv = 0.0f; // Almacena el último valor del potenciómetro
 
 // === Variables de Medición de Periodo Adaptativo (MÍNIMO HISTÓRICO) ===
-static volatile uint32_t g_semi_period_measured_us = 8600; 
+static volatile uint32_t g_semi_period_measured_us = 8400; 
 // =====================================================================
 
 // === Estados del Sistema ===
@@ -283,8 +283,13 @@ static void update_potentiometer() {
     // 3. Normalizar el voltaje al rango [0, 1]
     float normalized = (mv - POT_MIN_MV) / MV_RANGE;
     
-    // 4. Convertir a Punto Discreto (P de 0 a 999)
-    float point_float = normalized * NUM_POINTS_F;
+    // *** 4. COMPENSACIÓN INVERSA POR RAÍZ CUADRADA (Square Root Compensation) ***
+    // Propiedad: Genera un cambio RÁPIDO al inicio (bajo V_POT) y LENTO al final (alto V_POT),
+    // lo que da mayor resolución de control en la zona de alta corriente.
+    float compensated_factor = sqrtf(normalized); 
+    
+    // Convertir el valor compensado (0 a 1) a un punto de delay (0 a 999)
+    float point_float = compensated_factor * NUM_POINTS_F;
     uint32_t current_point = (uint32_t)floorf(point_float);
     
     if (current_point >= (uint32_t)NUM_POINTS_F) {
@@ -292,6 +297,7 @@ static void update_potentiometer() {
     }
     
     // 5. Mapeo Invertido y Discreto a Delay (usando el dynamic_delay_max capado)
+    // new_delay = DELAY_MAX - (current_point_compensado * DELAY_STEP_US)
     uint32_t new_delay = (uint32_t)(dynamic_delay_max - ((float)current_point * DELAY_STEP_US));
     
     // 6. Asegurar límites finales
@@ -330,7 +336,7 @@ static bool IRAM_ATTR on_alarm(gptimer_handle_t timer,
         // Disparo del Pulso (HIGH)
         gpio_set_level(SCR_PIN[p->idx], 1);
         
-        // ******* REPROGRAMACIÓN CLAVE: PULSO DE ANCHO FIJO (50 us) *******
+        // ******* PULSO DE ANCHO FIJO (PULSE_US) *******
         // Programar la alarma para apagar el pulso después de PULSE_US
         gptimer_alarm_config_t alarm_config = {
             .alarm_count = edata->alarm_value + PULSE_US,
@@ -343,7 +349,7 @@ static bool IRAM_ATTR on_alarm(gptimer_handle_t timer,
         p->next_is_high = false; // El próximo evento apaga el pulso
         
     } else {
-        // Apagado del Pulso (LOW) - Activado por la alarma de 50 us
+        // Apagado del Pulso (LOW) - Activado por la alarma de PULSE_US
         gpio_set_level(SCR_PIN[p->idx], 0); 
         
         // Deshabilitar futuras alarmas (hasta el próximo ZC)
@@ -407,10 +413,10 @@ static void IRAM_ATTR zc_isr(void* arg) {
     // *** Lógica Unificada para programar el Pulso en CADA ZC ***
     
     // 1. APAGADO FÍSICO INMEDIATO Y CANCELACIÓN DE ALARMA PENDIENTE
-    // ESTA ES LA SEGURIDAD ZC: APAGA CUALQUIER PULSO ACTIVO (ya sea sostenido o fijo de 50us)
+    // SEGURIDAD ZC: APAGA CUALQUIER PULSO ACTIVO (ya sea corto o extendido).
     gpio_set_level(SCR_PIN[idx], 0); 
     
-    // CORRECCIÓN CLAVE 2: AUMENTAR EL CONTADOR DE PULSOS AQUÍ (Semiciclo ZC Procesado)
+    // CORRECCIÓN: AUMENTAR EL CONTADOR DE PULSOS AQUÍ (Semiciclo ZC Procesado)
     uint32_t temp = g_pulse_count[idx];
     g_pulse_count[idx] = temp + 1;
     
@@ -434,7 +440,8 @@ static void IRAM_ATTR zc_isr(void* arg) {
         .alarm_count = (uint64_t)delay, // El contador inicia en 0, la alarma es el delay
         .reload_count = 0,
         .flags = { .auto_reload_on_alarm = false }
-    };
+    }
+    ;
     gptimer_set_alarm_action(p->timer, &alarm_config);
     p->next_is_high = true; // El próximo evento del timer es HIGH (el inicio del pulso)
 }
