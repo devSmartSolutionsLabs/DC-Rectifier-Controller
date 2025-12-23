@@ -21,6 +21,8 @@ static const char* TAG = "RECTIFICADOR";
 // --- NUEVAS CONSTANTES DE SEGURIDAD PARA EL POTENCIÓMETRO ---
 static constexpr float POT_DEADZONE_MV = 150.0f; // Si es menor a 150mV, forzar 0 Amperios
 static constexpr float HYSTERESIS_MV   = 25.0f;  // Evita saltos por ruido pequeño
+static float v_ema = POT_MIN_MV; 
+static bool v_ema_initialized = false;
 
 // === Configuración SCR ===
 static constexpr uint32_t PULSE_US       = 1000;     // ANCHO DEL PULSO: 700 us
@@ -131,8 +133,20 @@ static void control_relays() {
 }
 
 static void set_direction(bool forward) {
-    a2_on = forward;    // Forward
-    a3_on = !forward;   // Reverse
+    g_scr_enabled = false; // Bloqueo de seguridad
+    
+    // Reset de los filtros para que el nuevo ciclo empiece de cero real
+    v_ema = POT_MIN_MV;
+    v_ema_initialized = false;
+    
+    a2_on = forward;
+    a3_on = !forward;
+    control_relays();
+
+    // Pequeño delay de 100ms solo para esperar el movimiento mecánico del relé
+    vTaskDelay(pdMS_TO_TICKS(100)); 
+    
+    g_scr_enabled = true; // Ahora el sistema lee el potenciómetro desde el mínimo
 }
 
 // === Lectura de Botones ===
@@ -215,79 +229,67 @@ static void read_buttons() {
 
 static void update_potentiometer() {
     if (!g_ads) return;
-    
-    // --- PARTE 1: FILTRO DE MEDIANA (Elimina picos de ruido) ---
-    const int NUM_SAMPLES = 10; 
+
+    // 1. FILTRO DE MEDIANA (20 muestras para eliminar ruido de conmutación)
+    const int NUM_SAMPLES = 15; 
     float samples[NUM_SAMPLES];
     bool success = true;
 
     for (int i = 0; i < NUM_SAMPLES; ++i) {
-        if (!g_ads->singleShotMV(ADS1115::Mux::DIFF_0_1, ADS1115::PGA::FS_6V144, ADS1115::DataRate::SPS_128, samples[i])) {
-            ESP_LOGE(TAG, "ADS1115 I2C FAILED: Muestra %d fallida.", i);
+        if (!g_ads->singleShotMV(ADS1115::Mux::DIFF_0_1, ADS1115::PGA::FS_4V096, ADS1115::DataRate::SPS_128, samples[i])) {
             success = false;
             break; 
         }
     }
 
     if (!success) return; 
-    
     std::sort(samples, samples + NUM_SAMPLES);
     float v_mediana = samples[NUM_SAMPLES / 2]; 
-    
-    // --- PARTE 2: MEDIA MÓVIL EXPONENCIAL (EMA) ---
-    static float v_ema = 0.0f; 
-    static bool v_ema_initialized = false;
-    const float ALPHA = 0.30f; // Filtro un poco más agresivo (más lento pero más estable)
-    
-    if (!v_ema_initialized) { 
-        v_ema = v_mediana;
-        v_ema_initialized = true;
-    } else {
-        // Solo actualizar si el cambio es mayor a la histéresis para evitar jittering
-        if (std::abs(v_mediana - v_ema) > HYSTERESIS_MV) {
-            v_ema = (ALPHA * v_mediana) + ((1.0f - ALPHA) * v_ema);
-        }
-    }
-    
-    g_pot_mv = v_ema; 
 
-    // --- PARTE 3: LÓGICA DE MAPEO ADAPTATIVO Y SEGURIDAD ---
+    // === REINICIO CRÍTICO ===
+    // Si el SCR está apagado, forzamos el filtro al mínimo.
+    // Esto evita que cualquier ruido previo se quede "guardado".
+    if (!g_scr_enabled) {
+        v_ema = POT_MIN_MV; 
+        g_pot_mv = POT_MIN_MV;
+        g_scr_delay_us = g_current_delay_max_us; // Delay máximo = Corriente mínima
+        return;
+    }
+
+    // 2. FILTRO EMA (Suavizado suave para el movimiento del usuario)
+    // Usamos un ALPHA alto (0.6) para que sea reactivo al movimiento del usuario
+    const float ALPHA = 0.60f; 
+    v_ema = (ALPHA * v_mediana) + ((1.0f - ALPHA) * v_ema);
+    
+    float mv = v_ema;
+    g_pot_mv = mv; 
+
+    // 3. MAPEO ADAPTATIVO
     uint32_t dynamic_semi_period = g_semi_period_measured_us; 
-    if (dynamic_semi_period < MIN_PERIOD_VALID_US || dynamic_semi_period > MAX_PERIOD_VALID_US) { 
+    if (dynamic_semi_period < MIN_PERIOD_VALID_US || dynamic_semi_period > MAX_PERIOD_VALID_US) {
         dynamic_semi_period = DEFAULT_SEMI_PERIOD_US;
     }
 
     uint32_t dynamic_delay_max = (dynamic_semi_period > SAFE_MAX_DELAY_US) ? SAFE_MAX_DELAY_US : dynamic_semi_period;
     uint32_t dynamic_delay_min = (uint32_t)(dynamic_delay_max - DELAY_RANGE_US_F);
 
-    g_current_delay_max_us = dynamic_delay_max;
-    g_current_delay_min_us = dynamic_delay_min;
-
-    // === PROTECCIÓN DE PUNTO CERO (DEAD ZONE) ===
-    // Si el potenciómetro está muy bajo, forzamos delay máximo (apagado/mínimo)
-    if (v_ema < POT_DEADZONE_MV) {
+    // Protección de Zona Muerta (Deadzone)
+    if (mv < POT_DEADZONE_MV) {
         g_scr_delay_us = dynamic_delay_max;
-        return; // Salimos temprano para evitar cálculos de raíz cuadrada innecesarios
+        return;
     }
 
-    // Limitar rango superior
-    float mv_clamped = (v_ema > POT_MAX_MV) ? POT_MAX_MV : v_ema;
-    
-    // Normalizar al rango útil (restando el deadzone para suavizar la salida)
-    float range_useful = POT_MAX_MV - POT_DEADZONE_MV;
-    float normalized = (mv_clamped - POT_DEADZONE_MV) / range_useful;
+    // Normalización y Raíz Cuadrada (Mapeo a corriente)
+    float normalized = (mv - POT_MIN_MV) / (POT_MAX_MV - POT_MIN_MV);
     if (normalized < 0.0f) normalized = 0.0f;
+    if (normalized > 1.0f) normalized = 1.0f;
 
-    // Compensación por raíz cuadrada (da más precisión en corrientes altas)
     float compensated_factor = sqrtf(normalized); 
-    
     uint32_t current_point = (uint32_t)floorf(compensated_factor * NUM_POINTS_F);
-    if (current_point >= (uint32_t)NUM_POINTS_F) current_point = (uint32_t)NUM_POINTS_F - 1;
     
-    // Mapeo Invertido: a más voltaje -> menos delay -> más corriente
+    // Cálculo final del delay
     uint32_t new_delay = (uint32_t)(dynamic_delay_max - ((float)current_point * DELAY_STEP_US));
     
-    // Asegurar límites finales
     if (new_delay < dynamic_delay_min) new_delay = dynamic_delay_min;
     if (new_delay > dynamic_delay_max) new_delay = dynamic_delay_max;
     
