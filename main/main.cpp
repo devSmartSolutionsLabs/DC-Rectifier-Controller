@@ -8,6 +8,7 @@
 #include "esp_timer.h"
 #include "esp_log.h"
 #include "esp_task_wdt.h" 
+#include "esp_system.h" // Cabecera necesaria para esp_restart()
 #include <cmath>
 #include <algorithm> // Necesario para la función std::sort
 
@@ -18,8 +19,8 @@
 static const char* TAG = "RECTIFICADOR";
 
 // === Configuración SCR ===
-static constexpr uint32_t PULSE_US       = 700;     // ANCHO DEL PULSO: 700 us
-static constexpr uint32_t DEBOUNCE_US    = 2500;    // anti-rebote ZC (2.5 ms)
+static constexpr uint32_t PULSE_US       = 1000;     // ANCHO DEL PULSO: 700 us
+static constexpr uint32_t DEBOUNCE_US    = 2000;    // anti-rebote ZC (2.5 ms)
 static constexpr uint32_t DEFAULT_SEMI_PERIOD_US = 8333; // 60Hz
 
 // Pines 
@@ -38,15 +39,15 @@ static constexpr uint32_t   I2C_HZ  = 400000;
 // === CONSTANTES GLOBALES DE MAPEO (Refactorizadas) ===
 static constexpr float MAX_CURRENT_A    = 5000.0f;      // Corriente máxima total
 static constexpr float CURRENT_STEP_A   = 5.0f;         // Paso de corriente deseado (5A)
-static constexpr float DELAY_STEP_US    = 5.75f;         // Paso de delay deseado (6.0 us/punto)
+static constexpr float DELAY_STEP_US    = 5.0f;         // Paso de delay deseado (6.0 us/punto)
 
 // Constantes Derivadas
 static constexpr float NUM_POINTS_F     = MAX_CURRENT_A / CURRENT_STEP_A; // 5000A / 5A = 1000.0f
 static constexpr float DELAY_RANGE_US_F = NUM_POINTS_F * DELAY_STEP_US;   // 1000.0f * 6.0f = 6000.0f
 
 // Límites de Potenciómetro
-static constexpr float POT_MIN_MV       = 200.0f;  // Mínimo mapeado
-static constexpr float POT_MAX_MV       = 4100.0f;  // Máximo mapeado
+static constexpr float POT_MIN_MV       = 100.0f;  // Mínimo mapeado
+static constexpr float POT_MAX_MV       = 4000.0f;  // Máximo mapeado
 static constexpr float MV_RANGE         = POT_MAX_MV - POT_MIN_MV; 
 
 // Nuevo límite superior de seguridad
@@ -197,6 +198,12 @@ static void read_buttons() {
             shutting_down = false;
             ESP_LOGI(TAG, "Apagado completado");
             control_relays();
+            
+            ESP_LOGW(TAG, "Apagado completo. Reiniciando sistema para limpieza de estado...");
+            vTaskDelay(pdMS_TO_TICKS(500)); // Breve pausa para asegurar envío I2C
+                    
+                    // === RESET DEL SISTEMA ===
+            //esp_restart();
         }
     }
     // ESP_ERROR_CHECK(esp_task_wdt_reset()); // Se mueve a button_task
@@ -207,14 +214,14 @@ static void update_potentiometer() {
     if (!g_ads) return;
     
     // --- PARTE 1: FILTRO DE MEDIANA (Elimina picos de ruido) ---
-    const int NUM_SAMPLES = 11; 
+    const int NUM_SAMPLES = 20; 
     float samples[NUM_SAMPLES];
     bool success = true;
 
     for (int i = 0; i < NUM_SAMPLES; ++i) {
         if (g_ads->singleShotMV(ADS1115::Mux::DIFF_0_1,
                                ADS1115::PGA::FS_6V144,
-                               ADS1115::DataRate::SPS_64,
+                               ADS1115::DataRate::SPS_128 ,
                                samples[i])) {
             // SPS_64 toma ~15ms por muestra
         } else {
@@ -237,7 +244,7 @@ static void update_potentiometer() {
     // --- PARTE 2: MEDIA MÓVIL EXPONENCIAL (EMA) (Suaviza el drift lento) ---
     static float v_ema = 0.0f; 
     static bool v_ema_initialized = false;
-    const float ALPHA = 0.5f; 
+    const float ALPHA = 0.45f; 
     
     if (!v_ema_initialized) { 
         v_ema = v_mediana;
@@ -541,6 +548,9 @@ static void update_phases_enable() {
 
 // === Inicialización de Fase ===
 static void init_phase(int i, gpio_num_t zc, gpio_num_t scr) {
+    gpio_reset_pin(zc); // LIMPIEZA CRÍTICA PARA FASE C
+    gpio_reset_pin(scr);
+
     // SCR como salida
     gpio_config_t outc = {
         .pin_bit_mask = (1ULL << scr),
