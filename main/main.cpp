@@ -15,8 +15,16 @@
 #include "mcp23017.hpp"
 #include "ina226.hpp"
 
-static const char* TAG = "RECTIFICADOR";
+// Componentes de Red y OTA
+#include "WifiManager.hpp"
+#include "GitHubClient.hpp"
+#include "PortalWeb.hpp"
 
+static const char* TAG = "RECTIFICADOR";
+// Instancia del portal
+static PortalWeb g_portal;
+// Global en main.cpp
+volatile bool g_is_wifi_scanning = false; // Aquí sí se define y se inicializa
 // === Configuración SCR ===
 static constexpr uint32_t PULSE_US       = 700;     // ANCHO DEL PULSO: 700 us
 static constexpr uint32_t DEBOUNCE_US    = 2500;    // anti-rebote ZC (2.5 ms)
@@ -64,7 +72,9 @@ static volatile uint32_t g_current_delay_min_us = (uint32_t)(DEFAULT_SEMI_PERIOD
 
 // === Variables Globales del Sistema ===
 static volatile bool g_system_started = false;
-static volatile bool g_scr_enabled = false;
+extern "C" {
+    volatile bool g_scr_enabled = false;
+}
 static volatile uint32_t g_pulse_count[3] = {0, 0, 0};
 static volatile float g_pot_mv = 0.0f; // Almacena el último valor del potenciómetro
 
@@ -204,108 +214,117 @@ static void read_buttons() {
 
 // === Lectura de Potenciómetro y Mapeo Adaptativo ===
 static void update_potentiometer() {
-    if (!g_ads) return;
+    if (g_is_wifi_scanning) {
+        // No hacemos nada. El sistema usará el último valor de 'delay' guardado.
+        return; 
+    }
+
+    if (!g_ads || !g_i2c_mutex) return;
     
     // --- PARTE 1: FILTRO DE MEDIANA (Elimina picos de ruido) ---
     const int NUM_SAMPLES = 11; 
     float samples[NUM_SAMPLES];
     bool success = true;
 
-    for (int i = 0; i < NUM_SAMPLES; ++i) {
-        if (g_ads->singleShotMV(ADS1115::Mux::DIFF_0_1,
-                               ADS1115::PGA::FS_6V144,
-                               ADS1115::DataRate::SPS_64,
-                               samples[i])) {
-            // SPS_64 toma ~15ms por muestra
-        } else {
-            // Log de error I2C
-            ESP_LOGE(TAG, "ADS1115 I2C FAILED: Fallo en muestra %d. Lectura congelada.", i);
-            success = false;
-            break; 
+    if (xSemaphoreTake(g_i2c_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        const int NUM_SAMPLES = 5; // Reducimos muestras para no saturar el bus
+        float samples[NUM_SAMPLES];
+        bool success = true;
+
+        for (int i = 0; i < NUM_SAMPLES; ++i) {
+            if (!g_ads->singleShotMV(ADS1115::Mux::DIFF_0_1, ADS1115::PGA::FS_6V144, ADS1115::DataRate::SPS_64, samples[i])) {
+                success = false;
+                break;
+            }
         }
-    }
+        
+        xSemaphoreGive(g_i2c_mutex); // Liberar bus
 
-    if (!success) {
-        // Si falla la lectura, no actualizamos g_scr_delay_us ni g_pot_mv para mantener el último valor estable.
-        return; 
-    }
-    
-    // Aplicar Filtro de Mediana
-    std::sort(samples, samples + NUM_SAMPLES);
-    float v_mediana = samples[NUM_SAMPLES / 2]; // El valor central (limpio de picos)
-    
-    // --- PARTE 2: MEDIA MÓVIL EXPONENCIAL (EMA) (Suaviza el drift lento) ---
-    static float v_ema = 0.0f; 
-    static bool v_ema_initialized = false;
-    const float ALPHA = 0.5f; 
-    
-    if (!v_ema_initialized) { 
-        v_ema = v_mediana;
-        v_ema_initialized = true;
-    } else {
-        v_ema = (ALPHA * v_mediana) + ((1.0f - ALPHA) * v_ema);
-    }
-    
-    float mv = v_ema; // Usamos el valor suavizado para el control
-    
-    // ALMACENAR VALOR EMA
-    g_pot_mv = mv; 
+        if (!success) {
+            // Si falla la lectura, no actualizamos g_scr_delay_us ni g_pot_mv para mantener el último valor estable.
+            return; 
+        }
+        
+        // Aplicar Filtro de Mediana
+        std::sort(samples, samples + NUM_SAMPLES);
+        float v_mediana = samples[NUM_SAMPLES / 2]; // El valor central (limpio de picos)
+        
+        // --- PARTE 2: MEDIA MÓVIL EXPONENCIAL (EMA) (Suaviza el drift lento) ---
+        static float v_ema = 0.0f; 
+        static bool v_ema_initialized = false;
+        const float ALPHA = 0.5f; 
+        
+        if (!v_ema_initialized) { 
+            v_ema = v_mediana;
+            v_ema_initialized = true;
+        } else {
+            v_ema = (ALPHA * v_mediana) + ((1.0f - ALPHA) * v_ema);
+        }
+        
+        float mv = v_ema; // Usamos el valor suavizado para el control
+        
+        // ALMACENAR VALOR EMA
+        g_pot_mv = mv; 
 
-    // ------------------------------------------------------------------------------------------
-    // === LÓGICA DE MAPEO ADAPTATIVO Y SEGURO (MÍNIMO HISTÓRICO) ===
-    
-    // 1. Obtener el Mínimo Histórico del Semi-Período
-    uint32_t dynamic_semi_period = g_semi_period_measured_us; 
-    
-    // Aplicamos límites de validación de frecuencia para el fallback
-    if (dynamic_semi_period < MIN_PERIOD_VALID_US || dynamic_semi_period > MAX_PERIOD_VALID_US) { 
-        dynamic_semi_period = DEFAULT_SEMI_PERIOD_US;
-    }
+        // ------------------------------------------------------------------------------------------
+        // === LÓGICA DE MAPEO ADAPTATIVO Y SEGURO (MÍNIMO HISTÓRICO) ===
+        
+        // 1. Obtener el Mínimo Histórico del Semi-Período
+        uint32_t dynamic_semi_period = g_semi_period_measured_us; 
+        
+        // Aplicamos límites de validación de frecuencia para el fallback
+        if (dynamic_semi_period < MIN_PERIOD_VALID_US || dynamic_semi_period > MAX_PERIOD_VALID_US) { 
+            dynamic_semi_period = DEFAULT_SEMI_PERIOD_US;
+        }
 
-    // Aplicar el hard cap de seguridad (8320 us) sobre el Mínimo Histórico
-    uint32_t dynamic_delay_max;
-    if (dynamic_semi_period > SAFE_MAX_DELAY_US) {
-        dynamic_delay_max = SAFE_MAX_DELAY_US;
-    } else {
-        dynamic_delay_max = dynamic_semi_period;
-    }
-    
-    uint32_t dynamic_delay_min = (uint32_t)(dynamic_delay_max - DELAY_RANGE_US_F);
+        // Aplicar el hard cap de seguridad (8320 us) sobre el Mínimo Histórico
+        uint32_t dynamic_delay_max;
+        if (dynamic_semi_period > SAFE_MAX_DELAY_US) {
+            dynamic_delay_max = SAFE_MAX_DELAY_US;
+        } else {
+            dynamic_delay_max = dynamic_semi_period;
+        }
+        
+        uint32_t dynamic_delay_min = (uint32_t)(dynamic_delay_max - DELAY_RANGE_US_F);
 
-    // Actualizar las variables globales usadas en la tarea de monitoreo
-    g_current_delay_max_us = dynamic_delay_max;
-    g_current_delay_min_us = dynamic_delay_min;
+        // Actualizar las variables globales usadas en la tarea de monitoreo
+        g_current_delay_max_us = dynamic_delay_max;
+        g_current_delay_min_us = dynamic_delay_min;
 
-    // 2. Aplicar límites al voltaje
-    if (mv < POT_MIN_MV) mv = POT_MIN_MV;
-    if (mv > POT_MAX_MV) mv = POT_MAX_MV;
-    
-    // 3. Normalizar el voltaje al rango [0, 1]
-    float normalized = (mv - POT_MIN_MV) / MV_RANGE;
-    
-    // *** 4. COMPENSACIÓN INVERSA POR RAÍZ CUADRADA (Square Root Compensation) ***
-    // Propiedad: Genera un cambio RÁPIDO al inicio (bajo V_POT) y LENTO al final (alto V_POT),
-    // lo que da mayor resolución de control en la zona de alta corriente.
-    float compensated_factor = sqrtf(normalized); 
-    
-    // Convertir el valor compensado (0 a 1) a un punto de delay (0 a 999)
-    float point_float = compensated_factor * NUM_POINTS_F;
-    uint32_t current_point = (uint32_t)floorf(point_float);
-    
-    if (current_point >= (uint32_t)NUM_POINTS_F) {
-        current_point = (uint32_t)NUM_POINTS_F - 1; 
+        // 2. Aplicar límites al voltaje
+        if (mv < POT_MIN_MV) mv = POT_MIN_MV;
+        if (mv > POT_MAX_MV) mv = POT_MAX_MV;
+        
+        // 3. Normalizar el voltaje al rango [0, 1]
+        float normalized = (mv - POT_MIN_MV) / MV_RANGE;
+        
+        // *** 4. COMPENSACIÓN INVERSA POR RAÍZ CUADRADA (Square Root Compensation) ***
+        // Propiedad: Genera un cambio RÁPIDO al inicio (bajo V_POT) y LENTO al final (alto V_POT),
+        // lo que da mayor resolución de control en la zona de alta corriente.
+        float compensated_factor = sqrtf(normalized); 
+        
+        // Convertir el valor compensado (0 a 1) a un punto de delay (0 a 999)
+        float point_float = compensated_factor * NUM_POINTS_F;
+        uint32_t current_point = (uint32_t)floorf(point_float);
+        
+        if (current_point >= (uint32_t)NUM_POINTS_F) {
+            current_point = (uint32_t)NUM_POINTS_F - 1; 
+        }
+        
+        // 5. Mapeo Invertido y Discreto a Delay (usando el dynamic_delay_max capado)
+        // new_delay = DELAY_MAX - (current_point_compensado * DELAY_STEP_US)
+        uint32_t new_delay = (uint32_t)(dynamic_delay_max - ((float)current_point * DELAY_STEP_US));
+        
+        // 6. Asegurar límites finales
+        if (new_delay < dynamic_delay_min) new_delay = dynamic_delay_min;
+        if (new_delay > dynamic_delay_max) new_delay = dynamic_delay_max;
+        
+        // ALMACENAR VALOR FINAL DEL DELAY (usado por la ISR)
+        g_scr_delay_us = new_delay;
     }
-    
-    // 5. Mapeo Invertido y Discreto a Delay (usando el dynamic_delay_max capado)
-    // new_delay = DELAY_MAX - (current_point_compensado * DELAY_STEP_US)
-    uint32_t new_delay = (uint32_t)(dynamic_delay_max - ((float)current_point * DELAY_STEP_US));
-    
-    // 6. Asegurar límites finales
-    if (new_delay < dynamic_delay_min) new_delay = dynamic_delay_min;
-    if (new_delay > dynamic_delay_max) new_delay = dynamic_delay_max;
-    
-    // ALMACENAR VALOR FINAL DEL DELAY (usado por la ISR)
-    g_scr_delay_us = new_delay;
+    else {
+        ESP_LOGW(TAG, "I2C ocupado, saltando lectura de pot.");
+    }
 }
 
 // === Monitoreo INA226 (solo lectura, sin control) ===
@@ -509,7 +528,7 @@ static void monitor_task(void* arg) {
                  (unsigned long)measured_period_log, // NUEVO: Imprime el periodo mínimo histórico
                  g_scr_enabled ? "ON" : "OFF");
         
-        vTaskDelay(pdMS_TO_TICKS(500)); // Log cada 500 ms
+        vTaskDelay(pdMS_TO_TICKS(1500)); // Log cada 500 ms
     }
 }
 
@@ -576,9 +595,9 @@ static void init_phase(int i, gpio_num_t zc, gpio_num_t scr) {
         .clk_src = GPTIMER_CLK_SRC_DEFAULT,
         .direction = GPTIMER_COUNT_UP,
         .resolution_hz = 1000000,
-        .intr_priority = 1,
+        .intr_priority = 0,
         .flags = {
-            .intr_shared = false,
+            .intr_shared = true, // solo por agregar el wifi
             .allow_pd = false,
             .backup_before_sleep = false
         }
@@ -662,10 +681,32 @@ static void initialize_mcp_enables() {
 }
 
 extern "C" void app_main(void) {
+    // Primero inicializar los componentes de red/memoria
+    // En app_main:
+    WifiManager::init();
+
+    if (WifiManager::connect_saved()) {
+        ESP_LOGI(TAG, "Intentando conectar a red guardada...");
+        
+        // Esperar hasta 15 segundos o hasta que falle definitivamente
+        for(int i = 0; i < 150; i++) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            if (WifiManager::is_connected()) break;
+            if (WifiManager::should_fallback()) break;
+        }
+    }
+
+    // Si no hay red guardada, o si fallaron los reintentos:
+    if (!WifiManager::is_connected()) {
+        ESP_LOGW(TAG, "Abriendo modo configuracion (Portal)");
+        WifiManager::start_ap();
+        g_portal.start();
+    }
+    
     esp_log_level_set("*", ESP_LOG_INFO);
     ESP_LOGI(TAG, "=== INICIANDO SISTEMA COMPLETO ESP-IDF v5.5.1 ===");
 
-    // El watchdog se configura automáticamente, solo reconfiguramos el timeout.
+    // 2. CONFIGURACIÓN DEL WATCHDOG (WDT)
     
     esp_task_wdt_config_t wdt_config = {
         .timeout_ms = 60000,  // 60 segundos
@@ -684,7 +725,7 @@ extern "C" void app_main(void) {
     }
 
 
-    // ¡PRIMERO habilitar el MCP23017!
+    // 4. HARDWARE: MCP23017 Y BUS I2C
     initialize_mcp_enables();
 
     // Mutex
@@ -697,7 +738,12 @@ extern "C" void app_main(void) {
     // I2C
     i2c_init();
 
-    // Dispositivos I2C
+    // 5. INICIAR PORTAL WEB (Gestión WiFi y OTA GitHub)
+    if (g_portal.start() == ESP_OK) {
+        ESP_LOGI(TAG, "Portal Web iniciado en http://192.168.4.1 (o IP local)");
+    }
+
+    // 5. DISPOSITIVOS I2C
     g_ads = new ADS1115(I2C_PORT, 0x48, g_i2c_mutex);
     if (!g_ads->begin()) {
         ESP_LOGE(TAG, "Error inicializando ADS1115");
