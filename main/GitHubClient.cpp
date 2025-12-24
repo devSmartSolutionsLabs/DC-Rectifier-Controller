@@ -79,7 +79,8 @@ void GitHubClient::ota_task(void* pvParameter) {
    // CORRECCIÓN AQUÍ: 
     // En ESP-IDF v5.x, las redirecciones se manejan así:
     // Por defecto vienen habilitadas, pero si quieres asegurar:
-    // config.disable_auto_redirect = false; 
+    config.disable_auto_redirect = false; // Permitir que siga a Amazon S3
+    config.max_redirection_count = 5;      // Darle margen de saltos
 
     config.buffer_size_tx = 4096;
     config.buffer_size = 10240; 

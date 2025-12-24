@@ -221,16 +221,47 @@ esp_err_t PortalWeb::start() {
         httpd_register_uri_handler(_server, &uri_list);
 
         static httpd_uri_t uri_upd = {};
-        uri_upd.uri = "/do-update"; uri_upd.method = HTTP_GET;
+        uri_upd.uri = "/do-update"; 
+        uri_upd.method = HTTP_GET;
         uri_upd.handler = [](httpd_req_t *req){
             if(g_scr_enabled) return httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "Apague el SCR primero");
-            char b[512]; 
-            if(httpd_query_key_value(req->uri, "url", b, sizeof(b)) == ESP_OK){
-                GitHubClient::start_ota_from_url(b); 
-                return httpd_resp_sendstr(req, "Actualización iniciada...");
+
+            // 1. Obtener la query string completa de la URI
+            size_t query_len = httpd_req_get_url_query_len(req) + 1;
+            if (query_len <= 1) return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "URL faltante");
+
+            char* query_str = (char*)malloc(query_len);
+            httpd_req_get_url_query_str(req, query_str, query_len);
+
+            // 2. Extraer el valor del parámetro "url"
+            char url_encoded[512];
+            if (httpd_query_key_value(query_str, "url", url_encoded, sizeof(url_encoded)) == ESP_OK) {
+                
+                // 3. Decodificar caracteres (%3A -> :, %2F -> /)
+                std::string decoded_url = "";
+                for (size_t i = 0; url_encoded[i] != '\0'; i++) {
+                    if (url_encoded[i] == '%' && url_encoded[i+1] && url_encoded[i+2]) {
+                        char hex[3] = { url_encoded[i+1], url_encoded[i+2], '\0' };
+                        decoded_url += (char)strtol(hex, nullptr, 16);
+                        i += 2;
+                    } else if (url_encoded[i] == '+') {
+                        decoded_url += ' ';
+                    } else {
+                        decoded_url += url_encoded[i];
+                    }
+                }
+
+                ESP_LOGI("PORTAL_WEB", "Iniciando OTA hacia: %s", decoded_url.c_str());
+                
+                // 4. Iniciar proceso
+                GitHubClient::start_ota_from_url(decoded_url.c_str());
+                
+                free(query_str);
+                return httpd_resp_sendstr(req, "Actualización iniciada correctamente...");
             }
-            // CORRECCIÓN: Uso de constante enum en lugar de int 400
-            return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "URL incorrecta");
+
+            free(query_str);
+            return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "URL incorrecta o malformada");
         };
         httpd_register_uri_handler(_server, &uri_upd);
 
