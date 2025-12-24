@@ -24,6 +24,10 @@ static httpd_handle_t g_server_handle = NULL;
 static const char* root_html = R"rawliteral(
 <!DOCTYPE html><html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width, initial-scale=1'>
 <title>S3 Rectificador Pro - v{{VERSION}}</title>
+<div style='margin-top: 15px; border-bottom: 1px solid #333; padding-bottom: 10px;'>
+    <h2 style='margin: 0; color: #00ff00;'>{{TITULO_EQUIPO}}</h2>
+    <small style='color: #888;'>Firmware: v{{VERSION}}</small>
+</div>
 <style>
     body { font-family: 'Segoe UI', sans-serif; background: #121212; color: #e0e0e0; text-align: center; margin: 0; padding-bottom: 30px; }
     .nav { display: flex; background: #1e1e1e; position: sticky; top: 0; border-bottom: 1px solid #333; z-index: 100; }
@@ -87,6 +91,9 @@ static const char* root_html = R"rawliteral(
             <div id='releases-list'></div>
         </div></div>
     </div>
+    <div style='font-size: 0.8em; color: #444; margin-top: 20px;'>
+    ID Dispositivo: RECTIFICADOR 12V-5000A-{{VERSION}}
+    </div>
 <script>
     // Navegación de pestañas
     function tab(id){
@@ -140,7 +147,35 @@ static const char* root_html = R"rawliteral(
             l.appendChild(d);});
     });}
 
-    function doUpdate(url){ if(confirm("¿Desea iniciar la actualización de firmware?")) location.href='/do-update?url='+encodeURIComponent(url); }
+    function doUpdate(url) {
+    if (confirm("¿Desea iniciar la actualización de firmware?")) {
+        // Obtenemos el botón para dar feedback visual
+        const btn = event.target;
+        const originalText = btn.innerText;
+        
+        btn.disabled = true;
+        btn.innerHTML = "<span class='spinner'></span> ACTUALIZANDO...";
+
+        // Usamos fetch para que la petición ocurra por detrás (background)
+        fetch('/do-update?url=' + encodeURIComponent(url))
+            .then(response => {
+                if (response.ok) {
+                    alert("¡Actualización en curso! El equipo se reiniciará pronto. No apagues el rectificador.");
+                    // Opcional: Volver a la pestaña de Monitor para ver el último aliento de los datos
+                    tab('dash');
+                } else {
+                    alert("Error al iniciar actualización. Verifique si el SCR está encendido.");
+                    btn.disabled = false;
+                    btn.innerText = originalText;
+                }
+            })
+            .catch(err => {
+                alert("Error de conexión al iniciar OTA");
+                btn.disabled = false;
+                btn.innerText = originalText;
+            });
+    }
+}
 </script></body></html>
 )rawliteral";
 
@@ -181,14 +216,33 @@ esp_err_t PortalWeb::start() {
 
         // Registro de rutas con estructura limpia para evitar warnings
         static httpd_uri_t uri_root = {};
-        uri_root.uri = "/"; uri_root.method = HTTP_GET;
-        uri_root.handler = [](httpd_req_t *req){
-            std::string s = root_html; std::string v = esp_app_get_description()->version;
-            size_t p = s.find("{{VERSION}}");
-            while(p != std::string::npos){ s.replace(p,11,v); p=s.find("{{VERSION}}",p+v.length()); }
-            httpd_resp_set_type(req, "text/html; charset=utf-8");
-            return httpd_resp_send(req, s.c_str(), s.length());
-        };
+            uri_root.uri = "/"; 
+            uri_root.method = HTTP_GET;
+            uri_root.handler = [](httpd_req_t *req){
+                std::string s = root_html;
+                
+                // Obtener datos reales del firmware
+                const esp_app_desc_t *app_desc = esp_app_get_description();
+                std::string version = app_desc->version;
+                std::string nombre_proyecto = app_desc->project_name; // O puedes poner "Rectificador Industrial S3"
+
+                // 1. Reemplazar Versión
+                size_t p_ver = s.find("{{VERSION}}");
+                while(p_ver != std::string::npos){ 
+                    s.replace(p_ver, 11, version); 
+                    p_ver = s.find("{{VERSION}}", p_ver + version.length()); 
+                }
+
+                // 2. Reemplazar Título
+                size_t p_tit = s.find("{{TITULO_EQUIPO}}");
+                while(p_tit != std::string::npos){ 
+                    s.replace(p_tit, 17, nombre_proyecto); 
+                    p_tit = s.find("{{TITULO_EQUIPO}}", p_tit + nombre_proyecto.length()); 
+                }
+
+                httpd_resp_set_type(req, "text/html; charset=utf-8");
+                return httpd_resp_send(req, s.c_str(), s.length());
+            };
         httpd_register_uri_handler(_server, &uri_root);
 
         static httpd_uri_t uri_ws = {};
