@@ -21,8 +21,10 @@
 #include "PortalWeb.hpp"
 #include "esp_ota_ops.h" // Necesario para consultar la descripción de la app
 
-#define CURRENT_VERSION "3.0.0"
-
+#define CURRENT_VERSION "3.0.2"
+float g_corriente_actual = 0.0f;
+int g_potenciometro_mv = 0;
+bool g_scr_activo = false;
 static const char* TAG = "RECTIFICADOR";
 // Instancia del portal
 static PortalWeb g_portal;
@@ -497,41 +499,25 @@ static void control_task(void* arg) {
 }
 
 static void monitor_task(void* arg) {
-    // LLAMADA UNICA: Suscribir la tarea al WDT
-    ESP_ERROR_CHECK(esp_task_wdt_add(NULL));
-    ESP_LOGI(TAG, "Tarea monitoreo iniciada");
-    
+    ESP_ERROR_CHECK(esp_task_wdt_add(NULL)); 
     while (true) {
-        // LLAMADA REPETIDA: Resetear el WDT para indicar actividad
         esp_task_wdt_reset();
         
-        // Log consolidado (PULSOS + POT/DELAY) - Solo cada 500 ms (SOLICITADO)
-        
-        // Cálculo de Corriente para el Log (Inversión del mapeo)
-        // Usamos g_current_delay_max_us en lugar de la constante
+        // Cálculo de Corriente para el Log y la Telemetría
         uint32_t current_point = (uint32_t)floorf(((float)g_current_delay_max_us - g_scr_delay_us) / DELAY_STEP_US);
-        
-        // Asegurar límites del punto de 0 a (NUM_POINTS - 1)
         if (current_point >= (uint32_t)NUM_POINTS_F) current_point = (uint32_t)NUM_POINTS_F - 1;
         
-        // Corriente = Punto * CURRENT_STEP_A
-        uint32_t current_amps = (uint32_t)floorf((float)current_point * CURRENT_STEP_A);
+        float current_amps = (float)current_point * CURRENT_STEP_A;
 
-        // Periodo Medido: mostrar el valor del mínimo histórico usado como base para Max Delay
-        uint32_t measured_period_log = g_semi_period_measured_us;
+        // TELEMETRÍA: Actualizar variables globales para el WebSocket
+        g_corriente_actual = current_amps;
+        g_scr_activo = g_scr_enabled;
+
+        ESP_LOGI(TAG, "Monitor: Pulsos: A=%lu B=%lu C=%lu | Pot: %.0f mV | Delay: %lu us | Corriente: %.0f A | SCR=%s",
+                 (unsigned long)g_pulse_count[0], (unsigned long)g_pulse_count[1], (unsigned long)g_pulse_count[2],
+                 (double)g_pot_mv, (unsigned long)g_scr_delay_us, (double)current_amps, g_scr_enabled ? "ON" : "OFF");
         
-        ESP_LOGI(TAG, "Monitor: Pulsos: A=%lu B=%lu C=%lu | Pot: %.0f mV | Delay: %lu us | Corriente: %lu A | Max Delay: %lu us | Periodo Minimo Historico (T/2): %lu us | SCR=%s",
-                 (unsigned long)g_pulse_count[0],
-                 (unsigned long)g_pulse_count[1], 
-                 (unsigned long)g_pulse_count[2],
-                 (double)g_pot_mv, // Imprime el valor EMA suavizado
-                 (unsigned long)g_scr_delay_us,
-                 (unsigned long)current_amps, // Imprime la corriente discreta
-                 (unsigned long)g_current_delay_max_us, // Imprime el DELAY_MAX DINÁMICO
-                 (unsigned long)measured_period_log, // NUEVO: Imprime el periodo mínimo histórico
-                 g_scr_enabled ? "ON" : "OFF");
-        
-        vTaskDelay(pdMS_TO_TICKS(1500)); // Log cada 500 ms
+        vTaskDelay(pdMS_TO_TICKS(1500)); 
     }
 }
 
@@ -808,6 +794,7 @@ extern "C" void app_main(void) {
     while (true) {
         esp_task_wdt_reset();
         update_phases_enable();
+        g_scr_activo = g_scr_enabled;
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }

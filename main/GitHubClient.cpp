@@ -6,7 +6,9 @@
 #include "esp_heap_caps.h"
 #include "esp_crt_bundle.h"
 #include "esp_ota_ops.h"
-
+#include <sstream>
+#include <vector>
+#include <cstdlib> // Necesario para atoi
 static const char *TAG = "GH_CLIENT";
 
 // URL base de tu repositorio
@@ -23,12 +25,38 @@ std::string GitHubClient::get_current_version() {
     return esp_app_get_description()->version;
 }
 
-bool GitHubClient::is_newer_version(std::string remote_version, std::string local_version) {
-    // Limpieza simple de la 'v' inicial si existe (v3.0.0 -> 3.0.0)
-    if (!remote_version.empty() && remote_version[0] == 'v') remote_version.erase(0, 1);
-    if (!local_version.empty() && local_version[0] == 'v') local_version.erase(0, 1);
-    
-    return remote_version != local_version; // Comparación alfanumérica básica
+bool GitHubClient::is_newer_version(std::string remote, std::string local) {
+    // 1. Limpiar la 'v' si existe
+    if (!remote.empty() && remote[0] == 'v') remote.erase(0, 1);
+    if (!local.empty() && local[0] == 'v') local.erase(0, 1);
+
+    // 2. Si son iguales, no es nueva
+    if (remote == local) return false;
+
+    // 3. Trocear las versiones por los puntos manualmente sin excepciones
+    auto split = [](const std::string& s) {
+        std::vector<int> res;
+        std::string part;
+        std::stringstream ss(s);
+        while (std::getline(ss, part, '.')) {
+            // Usamos atoi que es seguro y no lanza excepciones
+            res.push_back(atoi(part.c_str())); 
+        }
+        // Asegurar que siempre tengamos al menos 3 componentes (Major.Minor.Patch)
+        while(res.size() < 3) res.push_back(0);
+        return res;
+    };
+
+    std::vector<int> v_rem = split(remote);
+    std::vector<int> v_loc = split(local);
+
+    // 4. Comparar jerárquicamente
+    for (size_t i = 0; i < 3; i++) {
+        if (v_rem[i] > v_loc[i]) return true;  // La remota es mayor
+        if (v_rem[i] < v_loc[i]) return false; // La remota es menor
+    }
+
+    return false;
 }
 
 void GitHubClient::start_ota_from_url(const char* url) {
@@ -139,7 +167,7 @@ std::vector<ReleaseInfo> GitHubClient::get_releases(const char* repo) {
                             
                             // 2. Lógica de comparación: ¿Es diferente a la actual?
                             // Si el tag de GitHub no es igual al que tenemos grabado, es "new"
-                            bool is_new = (remote_tag != current_version);
+                            bool is_new = is_newer_version(remote_tag, current_version);
                             
                             // Agregamos a la lista con la info completa
                             list.push_back({remote_tag, bin_url->valuestring, is_new});
