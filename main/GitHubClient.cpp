@@ -5,6 +5,7 @@
 #include "cJSON.h"
 #include "esp_heap_caps.h"
 #include "esp_crt_bundle.h"
+#include "esp_ota_ops.h"
 
 static const char *TAG = "GH_CLIENT";
 
@@ -16,6 +17,19 @@ extern "C" {
 }
 
 static char* github_url_to_save = nullptr;
+
+
+std::string GitHubClient::get_current_version() {
+    return esp_app_get_description()->version;
+}
+
+bool GitHubClient::is_newer_version(std::string remote_version, std::string local_version) {
+    // Limpieza simple de la 'v' inicial si existe (v3.0.0 -> 3.0.0)
+    if (!remote_version.empty() && remote_version[0] == 'v') remote_version.erase(0, 1);
+    if (!local_version.empty() && local_version[0] == 'v') local_version.erase(0, 1);
+    
+    return remote_version != local_version; // Comparación alfanumérica básica
+}
 
 void GitHubClient::start_ota_from_url(const char* url) {
     if (github_url_to_save != nullptr) free(github_url_to_save);
@@ -46,7 +60,7 @@ void GitHubClient::ota_task(void* pvParameter) {
     ota_config.http_config = &config;
 
     esp_err_t ret = esp_https_ota(&ota_config);
-    
+
     if (ret == ESP_OK) {
         ESP_LOGI(TAG, "Actualización completada con éxito. Reiniciando...");
         vTaskDelay(pdMS_TO_TICKS(2000));
@@ -65,11 +79,15 @@ void GitHubClient::ota_task(void* pvParameter) {
 std::vector<ReleaseInfo> GitHubClient::get_releases(const char* repo) {
     std::vector<ReleaseInfo> list;
     
-    // Usamos el repo por defecto si no se pasa uno
+    // 1. Obtener la versión que el ESP32 tiene grabada actualmente (vía CMake PROJECT_VER)
+    const esp_app_desc_t *app_desc = esp_app_get_description();
+    std::string current_version = app_desc->version;
+    ESP_LOGI(TAG, "Versión local detectada: %s", current_version.c_str());
+
     const char* target_repo = (repo && strlen(repo) > 0) ? repo : REPO_PATH;
-    
     const size_t BUF_SIZE = 32768;
     char* json_buf = (char*)heap_caps_malloc(BUF_SIZE, MALLOC_CAP_SPIRAM);
+    
     if (!json_buf) {
         ESP_LOGE(TAG, "Error: Memoria insuficiente en PSRAM");
         return list;
@@ -84,8 +102,7 @@ std::vector<ReleaseInfo> GitHubClient::get_releases(const char* repo) {
     config.user_agent = "ESP32-S3-Rectificador-v1";
     config.crt_bundle_attach = esp_crt_bundle_attach;
     config.timeout_ms = 15000;
-    config.skip_cert_common_name_check = true; // Ignora el nombre del host
-    config.cert_pem = NULL; // No cargamos certificado manual
+    config.skip_cert_common_name_check = true; 
 
     esp_http_client_handle_t client = esp_http_client_init(&config);
     esp_http_client_set_header(client, "Accept", "application/vnd.github.v3+json");
@@ -111,16 +128,22 @@ std::vector<ReleaseInfo> GitHubClient::get_releases(const char* repo) {
                 cJSON *assets = cJSON_GetObjectItem(release, "assets");
                 
                 if (cJSON_IsString(tag) && cJSON_IsArray(assets)) {
-                    // Buscamos el primer archivo .bin dentro de los assets
+                    std::string remote_tag = tag->valuestring;
+                    
                     cJSON *asset = NULL;
                     cJSON_ArrayForEach(asset, assets) {
                         cJSON *name = cJSON_GetObjectItem(asset, "name");
                         cJSON *bin_url = cJSON_GetObjectItem(asset, "browser_download_url");
                         
-                        // Validamos que el nombre termine en .bin para no descargar el código fuente por error
                         if (cJSON_IsString(name) && strstr(name->valuestring, ".bin") && cJSON_IsString(bin_url)) {
-                            list.push_back({tag->valuestring, bin_url->valuestring});
-                            break; // Solo tomamos el primer binario encontrado por versión
+                            
+                            // 2. Lógica de comparación: ¿Es diferente a la actual?
+                            // Si el tag de GitHub no es igual al que tenemos grabado, es "new"
+                            bool is_new = (remote_tag != current_version);
+                            
+                            // Agregamos a la lista con la info completa
+                            list.push_back({remote_tag, bin_url->valuestring, is_new});
+                            break; 
                         }
                     }
                 }
@@ -134,6 +157,6 @@ std::vector<ReleaseInfo> GitHubClient::get_releases(const char* repo) {
     esp_http_client_cleanup(client);
     heap_caps_free(json_buf);
     
-    ESP_LOGI(TAG, "Se encontraron %d versiones disponibles en GitHub.", (int)list.size());
+    ESP_LOGI(TAG, "Se encontraron %d versiones. Local: %s", (int)list.size(), current_version.c_str());
     return list;
 }

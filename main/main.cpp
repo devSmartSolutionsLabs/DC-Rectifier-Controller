@@ -19,6 +19,9 @@
 #include "WifiManager.hpp"
 #include "GitHubClient.hpp"
 #include "PortalWeb.hpp"
+#include "esp_ota_ops.h" // Necesario para consultar la descripción de la app
+
+#define CURRENT_VERSION "3.0.0"
 
 static const char* TAG = "RECTIFICADOR";
 // Instancia del portal
@@ -681,6 +684,13 @@ static void initialize_mcp_enables() {
 }
 
 extern "C" void app_main(void) {
+    const esp_app_desc_t *app_desc = esp_app_get_description();    
+    ESP_LOGI("SISTEMA", "##########################################");
+    ESP_LOGI("SISTEMA", " PROYECTO: %s", app_desc->project_name);
+    ESP_LOGI("SISTEMA", " VERSION : %s", app_desc->version); // Aquí saldrá "3.0.1"
+    ESP_LOGI("SISTEMA", " COMPILADO: %s %s", app_desc->date, app_desc->time);
+    ESP_LOGI("SISTEMA", "##########################################");
+
     // Primero inicializar los componentes de red/memoria
     // En app_main:
     WifiManager::init();
