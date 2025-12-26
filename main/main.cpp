@@ -18,15 +18,10 @@
 
 static const char* TAG = "RECTIFICADOR";
 
-// --- NUEVAS CONSTANTES DE SEGURIDAD PARA EL POTENCIÓMETRO ---
-static constexpr float POT_DEADZONE_MV = 150.0f; // Si es menor a 150mV, forzar 0 Amperios
-static constexpr float HYSTERESIS_MV   = 25.0f;  // Evita saltos por ruido pequeño
-static float v_ema = POT_MIN_MV; 
-static bool v_ema_initialized = false;
 
 // === Configuración SCR ===
-static constexpr uint32_t PULSE_US       = 1000;     // ANCHO DEL PULSO: 700 us
-static constexpr uint32_t DEBOUNCE_US    = 2000;    // anti-rebote ZC (2.5 ms)
+static constexpr uint32_t PULSE_US       = 500;     // ANCHO DEL PULSO: 700 us
+static constexpr uint32_t DEBOUNCE_US    = 500;    // anti-rebote ZC (2.5 ms)
 static constexpr uint32_t DEFAULT_SEMI_PERIOD_US = 8333; // 60Hz
 
 // Pines 
@@ -44,7 +39,7 @@ static constexpr uint32_t   I2C_HZ  = 400000;
 
 // === CONSTANTES GLOBALES DE MAPEO (Refactorizadas) ===
 static constexpr float MAX_CURRENT_A    = 5000.0f;      // Corriente máxima total
-static constexpr float CURRENT_STEP_A   = 5.0f;         // Paso de corriente deseado (5A)
+static constexpr float CURRENT_STEP_A   = 4.0f;         // Paso de corriente deseado (5A)
 static constexpr float DELAY_STEP_US    = 5.0f;         // Paso de delay deseado (6.0 us/punto)
 
 // Constantes Derivadas
@@ -56,8 +51,17 @@ static constexpr float POT_MIN_MV       = 100.0f;  // Mínimo mapeado
 static constexpr float POT_MAX_MV       = 4000.0f;  // Máximo mapeado
 static constexpr float MV_RANGE         = POT_MAX_MV - POT_MIN_MV; 
 
+// --- NUEVAS CONSTANTES DE SEGURIDAD PARA EL POTENCIÓMETRO ---
+static constexpr float POT_DEADZONE_MV = 50.0f; // Si es menor a 150mV, forzar 0 Amperios
+static constexpr float HYSTERESIS_MV   = 15.0f;  // Evita saltos por ruido pequeño
+// --- Variables de Control de Potenciómetro ---
+static float v_ema = 100.0f; 
+static uint32_t last_applied_delay = DEFAULT_SEMI_PERIOD_US;
+static constexpr float SAFE_DEADZONE_MV = 50.0f; // Ignora ruido hasta 200mV
+static constexpr uint32_t MAX_DELAY_STEP_US = 100; // Máximo cambio de delay por ciclo (100ms)
+
 // Nuevo límite superior de seguridad
-static constexpr uint32_t SAFE_MAX_DELAY_US = 8320; // Hard cap para el delay máximo (seguridad)
+static constexpr uint32_t SAFE_MAX_DELAY_US = 8300; // Hard cap para el delay máximo (seguridad)
 
 // === LÍMITES DE VALIDACIÓN DE FRECUENCIA ===
 static constexpr uint32_t MIN_PERIOD_VALID_US = 8264; // 60.5 Hz (Período más corto)
@@ -133,20 +137,20 @@ static void control_relays() {
 }
 
 static void set_direction(bool forward) {
-    g_scr_enabled = false; // Bloqueo de seguridad
+    g_scr_enabled = false; 
     
-    // Reset de los filtros para que el nuevo ciclo empiece de cero real
+    // Reset total de filtros y estados
     v_ema = POT_MIN_MV;
-    v_ema_initialized = false;
+    last_applied_delay = DEFAULT_SEMI_PERIOD_US;
     
     a2_on = forward;
     a3_on = !forward;
     control_relays();
 
-    // Pequeño delay de 100ms solo para esperar el movimiento mecánico del relé
-    vTaskDelay(pdMS_TO_TICKS(100)); 
+    // Tiempo muerto para que el relé físico cambie sin carga
+    vTaskDelay(pdMS_TO_TICKS(150)); 
     
-    g_scr_enabled = true; // Ahora el sistema lee el potenciómetro desde el mínimo
+    g_scr_enabled = true; 
 }
 
 // === Lectura de Botones ===
@@ -230,7 +234,7 @@ static void read_buttons() {
 static void update_potentiometer() {
     if (!g_ads) return;
 
-    // 1. FILTRO DE MEDIANA (20 muestras para eliminar ruido de conmutación)
+    // --- PARTE 1: FILTRO DE MEDIANA (20 MUESTRAS) ---
     const int NUM_SAMPLES = 15; 
     float samples[NUM_SAMPLES];
     bool success = true;
@@ -243,57 +247,68 @@ static void update_potentiometer() {
     }
 
     if (!success) return; 
+
     std::sort(samples, samples + NUM_SAMPLES);
     float v_mediana = samples[NUM_SAMPLES / 2]; 
 
-    // === REINICIO CRÍTICO ===
-    // Si el SCR está apagado, forzamos el filtro al mínimo.
-    // Esto evita que cualquier ruido previo se quede "guardado".
+    // --- PARTE 2: REINICIO Y FILTRADO EMA ---
     if (!g_scr_enabled) {
-        v_ema = POT_MIN_MV; 
-        g_pot_mv = POT_MIN_MV;
-        g_scr_delay_us = g_current_delay_max_us; // Delay máximo = Corriente mínima
+        v_ema = POT_MIN_MV;
+        last_applied_delay = g_current_delay_max_us;
+        g_scr_delay_us = g_current_delay_max_us;
+        g_pot_mv = v_mediana;
         return;
     }
 
-    // 2. FILTRO EMA (Suavizado suave para el movimiento del usuario)
-    // Usamos un ALPHA alto (0.6) para que sea reactivo al movimiento del usuario
+    // Filtro EMA para suavizar el movimiento de la mano
     const float ALPHA = 0.60f; 
     v_ema = (ALPHA * v_mediana) + ((1.0f - ALPHA) * v_ema);
+    g_pot_mv = v_ema;
+
+    // --- PARTE 3: LÓGICA DE ZONA MUERTA REFORZADA ---
+    uint32_t dynamic_delay_max = (g_semi_period_measured_us > SAFE_MAX_DELAY_US) ? SAFE_MAX_DELAY_US : g_semi_period_measured_us;
     
-    float mv = v_ema;
-    g_pot_mv = mv; 
-
-    // 3. MAPEO ADAPTATIVO
-    uint32_t dynamic_semi_period = g_semi_period_measured_us; 
-    if (dynamic_semi_period < MIN_PERIOD_VALID_US || dynamic_semi_period > MAX_PERIOD_VALID_US) {
-        dynamic_semi_period = DEFAULT_SEMI_PERIOD_US;
-    }
-
-    uint32_t dynamic_delay_max = (dynamic_semi_period > SAFE_MAX_DELAY_US) ? SAFE_MAX_DELAY_US : dynamic_semi_period;
-    uint32_t dynamic_delay_min = (uint32_t)(dynamic_delay_max - DELAY_RANGE_US_F);
-
-    // Protección de Zona Muerta (Deadzone)
-    if (mv < POT_DEADZONE_MV) {
+    if (v_ema < SAFE_DEADZONE_MV) {
         g_scr_delay_us = dynamic_delay_max;
+        last_applied_delay = dynamic_delay_max;
         return;
     }
 
-    // Normalización y Raíz Cuadrada (Mapeo a corriente)
-    float normalized = (mv - POT_MIN_MV) / (POT_MAX_MV - POT_MIN_MV);
+// --- PARTE 4: NORMALIZACIÓN Y COMPENSACIÓN SUAVE ---
+    // Asegúrate de que POT_MAX_MV sea realmente el voltaje máximo que entrega tu pote (ej. 3300 o 4000)
+    float normalized = (v_ema - SAFE_DEADZONE_MV) / (POT_MAX_MV - SAFE_DEADZONE_MV);
     if (normalized < 0.0f) normalized = 0.0f;
     if (normalized > 1.0f) normalized = 1.0f;
 
-    float compensated_factor = sqrtf(normalized); 
+    // Usamos potencia 1.2 en lugar de raíz cuadrada (0.5). 
+    // Esto hace que el inicio de la curva sea mucho más plano y controlable.
+    float compensated_factor = powf(normalized, 1.3f); 
+
     uint32_t current_point = (uint32_t)floorf(compensated_factor * NUM_POINTS_F);
+    if (current_point >= (uint32_t)NUM_POINTS_F) current_point = (uint32_t)NUM_POINTS_F - 1;
     
-    // Cálculo final del delay
-    uint32_t new_delay = (uint32_t)(dynamic_delay_max - ((float)current_point * DELAY_STEP_US));
+    // Calcular el Delay Objetivo (Target)
+    uint32_t target_delay = (uint32_t)(dynamic_delay_max - ((float)current_point * DELAY_STEP_US));
+
+    // --- PARTE 5: SLEW RATE LIMITER (EVITA SALTOS BRUSCOS) ---
+    // Si el cambio solicitado es mayor a 150us, lo limitamos.
+    uint32_t final_delay = target_delay;
     
-    if (new_delay < dynamic_delay_min) new_delay = dynamic_delay_min;
-    if (new_delay > dynamic_delay_max) new_delay = dynamic_delay_max;
-    
-    g_scr_delay_us = new_delay;
+    if (target_delay < last_applied_delay) {
+        uint32_t diff = last_applied_delay - target_delay;
+        if (diff > MAX_DELAY_STEP_US) {
+            final_delay = last_applied_delay - MAX_DELAY_STEP_US;
+        }
+    } else if (target_delay > last_applied_delay) {
+        uint32_t diff = target_delay - last_applied_delay;
+        if (diff > MAX_DELAY_STEP_US) {
+            final_delay = last_applied_delay + MAX_DELAY_STEP_US;
+        }
+    }
+
+    // Guardar para el próximo ciclo y aplicar
+    last_applied_delay = final_delay;
+    g_scr_delay_us = final_delay;
 }
 
 // === Monitoreo INA226 (solo lectura, sin control) ===
