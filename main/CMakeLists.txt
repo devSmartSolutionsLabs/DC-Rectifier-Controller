@@ -8,6 +8,7 @@ idf_component_register(
         "GitHubClient.cpp"
         "PortalWeb.cpp"
         "LoggerFS.cpp"
+        "CommandManager.cpp"
     INCLUDE_DIRS "."
     EMBED_TXTFILES "github_root_ca.pem"
     REQUIRES 
