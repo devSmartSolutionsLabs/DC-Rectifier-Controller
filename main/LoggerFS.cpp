@@ -78,6 +78,24 @@ void LoggerFS::checkRotation() {
     }
 }
 
+void LoggerFS::registrarEstructurado(RectEvent evento, std::string valor, std::string nota) {
+    std::lock_guard<std::mutex> lock(_mutex);
+    checkRotation();
+
+    FILE* f = fopen(_full_path.c_str(), "a");
+    if (f == NULL) return;
+
+    // Guardamos el ID en Hexadecimal para que sea fácil de filtrar
+    fprintf(f, "%s,0x%04X,%s,%s\n", 
+            getLimaTimestamp().c_str(),
+            static_cast<uint16_t>(evento),
+            valor.empty() ? "-" : valor.c_str(),
+            nota.empty() ? "-" : nota.c_str());
+
+    fsync(fileno(f));
+    fclose(f);
+}
+
 void LoggerFS::registrar(RectEvent evento, const RectStatus& status, const std::string& nota) {
     std::lock_guard<std::mutex> lock(_mutex);
     checkRotation();

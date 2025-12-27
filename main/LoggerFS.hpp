@@ -8,14 +8,33 @@
 
 enum class RectDirection : uint8_t { FORWARD = 0, REVERSE = 1 };
 
-enum class RectEvent : uint8_t {
-    BOOT           = 0x01,
-    PROCESS_START  = 0x02,
-    PROCESS_STOP   = 0x03,
-    INTERRUPTION   = 0x04,
-    ERROR_HARDWARE = 0x05,
-    CONFIG_CHANGE  = 0x06,
-    NETWORK_ST     = 0x07 
+enum class RectEvent : uint16_t {
+    // CATEGORIA 01: SISTEMA
+    BOOT            = 0x0100,  // Arranque normal (Power ON)
+    BOOT_WDT        = 0x0101,  // Reinicio por Watchdog (Cuelgue)
+    BOOT_SOFT       = 0x0102,  // Reinicio por Software (Post-OTA o Config)
+    HEARTBEAT       = 0x0103,  // Pulso periódico de vida
+
+    // CATEGORIA 02: PROCESO (POTENCIA)
+    PROCESS_START   = 0x0200,
+    PROCESS_STOP    = 0x0201,
+    POT_CHANGE      = 0x0202, // Cambio de potenciómetro
+
+    // CATEGORIA 05: ERRORES
+    ERR_I2C         = 0x0501,
+    ERR_WDT         = 0x0502,
+    ERR_SYSTEM      = 0x0503,
+
+    // CATEGORIA 06: CONFIG/USUARIO
+    CONFIG_CHANGE  = 0x0600,  // Evento genérico de configuración
+    LOG_CLEARED     = 0x0601,
+    OTA_START       = 0x0602,
+
+    // CATEGORIA 07: RED
+    NET_AP_START    = 0x0700,
+    NET_IP          = 0x0701,
+    NET_SSID        = 0x0702,
+    NET_RSSI        = 0x0703
 };
 
 struct RectStatus {
@@ -30,6 +49,7 @@ public:
     explicit LoggerFS(const char* base_path);
     bool begin(); 
     void registrar(RectEvent evento, const RectStatus& status, const std::string& nota = "");
+    void registrarEstructurado(RectEvent evento, std::string valor, std::string nota);
     void limpiarLog();
     std::string getFilePath() const { return _full_path; }
 
