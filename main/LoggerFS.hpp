@@ -13,7 +13,8 @@ enum class RectEvent : uint8_t {
     PROCESS_STOP   = 0x03,
     INTERRUPTION   = 0x04,
     ERROR_HARDWARE = 0x05,
-    CONFIG_CHANGE  = 0x06
+    CONFIG_CHANGE  = 0x06,
+    NETWORK_ST     = 0x07  // Estado de Red (Conexión/Desconexión)
 };
 
 struct RectStatus {
