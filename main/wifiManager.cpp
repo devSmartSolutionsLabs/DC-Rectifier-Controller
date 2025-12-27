@@ -118,8 +118,9 @@ void WifiManager::save_and_reconnect(std::string ssid, std::string pass) {
         nvs_close(handle);
         ESP_LOGI(TAG, "Credenciales guardadas en NVS (storage)");
     }
-    ESP_LOGW(TAG, "Reiniciando sistema para aplicar nueva configuracion...");
-    vTaskDelay(pdMS_TO_TICKS(1500));
+    ESP_LOGW(TAG, "Credenciales guardadas. Reiniciando en 3 segundos...");
+    // Damos tiempo al PortalWeb para terminar la petición HTTP
+    vTaskDelay(pdMS_TO_TICKS(3000));
     esp_restart();
 }
 
