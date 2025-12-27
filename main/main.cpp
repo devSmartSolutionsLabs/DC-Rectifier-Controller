@@ -23,7 +23,8 @@
 #include "LoggerFS.hpp"
 #include "esp_sntp.h" // Necesario para la hora de Lima
 
-
+#include "driver/uart.h"
+#include "CommandManager.hpp"
 
 #define CURRENT_VERSION "3.0.2"
 float g_corriente_actual = 0.0f;
@@ -110,7 +111,7 @@ static MCP23017* g_mcp = nullptr;
 static INA226* g_ina = nullptr;
 
 // Instancia Global del Logger
-static LoggerFS g_logger("/spiffs");
+LoggerFS g_logger("/spiffs");
 
 RectStatus obtener_estado_actual() {
     RectStatus status;
@@ -687,10 +688,10 @@ static void initialize_mcp_enables() {
 
 void iniciar_sincronizacion_tiempo() {
     ESP_LOGI(TAG, "Configurando SNTP para Lima, Peru...");
-    sntp_setoperatingmode(SNTP_OPMODE_POLL);
-    sntp_setservername(0, "pool.ntp.org");
-    sntp_setservername(1, "south-america.pool.ntp.org");
-    sntp_init();
+    esp_sntp_setoperatingmode(SNTP_OPMODE_POLL); // Usar esp_sntp_...
+    esp_sntp_setservername(0, "pool.ntp.org");
+    esp_sntp_setservername(1, "south-america.pool.ntp.org");
+    esp_sntp_init(); // Usar esp_sntp_...
 
     // Lima no tiene horario de verano, es UTC-5 fijo
     setenv("TZ", "PET5", 1); 
@@ -708,11 +709,13 @@ extern "C" void app_main(void) {
     if (g_logger.begin()) {
         ESP_LOGI(TAG, "LoggerFS inicializado correctamente.");
     }
+    
+    // Primero inicializar los componentes de red/memoria
+    WifiManager::init();
+
     iniciar_sincronizacion_tiempo();
     // Registro inicial: BOOT
     g_logger.registrar(RectEvent::BOOT, obtener_estado_actual(), "Arranque del sistema v" CURRENT_VERSION);
-    // Primero inicializar los componentes de red/memoria
-    WifiManager::init();
 
     if (WifiManager::connect_saved()) {
         ESP_LOGI(TAG, "Intentando conectar a red guardada...");
@@ -762,7 +765,17 @@ extern "C" void app_main(void) {
     if (esp_task_wdt_add(NULL) != ESP_OK) {
         ESP_LOGW(TAG, "Error agregando tarea principal al WDT.");
     }
-
+    
+    uart_config_t uart_config = {
+        .baud_rate = 115200,
+        .data_bits = UART_DATA_8_BITS,
+        .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_DEFAULT,
+    };
+    uart_driver_install(UART_NUM_0, 1024, 0, 0, NULL, 0);
+    uart_param_config(UART_NUM_0, &uart_config);
 
     // 4. HARDWARE: MCP23017 Y BUS I2C
     initialize_mcp_enables();
@@ -834,7 +847,7 @@ extern "C" void app_main(void) {
 
     ESP_LOGI(TAG, "Sistema listo. Esperando comando START...");
     g_logger.registrar(RectEvent::CONFIG_CHANGE, obtener_estado_actual(), "Hardware Listo - Esperando Operario");
-    
+
     ESP_LOGI(TAG, "Mapeo Pot: %.0f mV-%.0f mV -> 0A-%.0fA (%.0f pasos, %.1f us/paso) | Max Delay Seguro: %lu us",
              POT_MIN_MV, POT_MAX_MV, MAX_CURRENT_A, NUM_POINTS_F, DELAY_STEP_US, SAFE_MAX_DELAY_US);
 
@@ -843,6 +856,17 @@ extern "C" void app_main(void) {
         esp_task_wdt_reset();
         update_phases_enable();
         g_scr_activo = g_scr_enabled;
+
+        // Leer Serial
+        uint8_t data[256];
+        int len = uart_read_bytes(UART_NUM_0, data, sizeof(data)-1, pdMS_TO_TICKS(50));
+        if (len > 0) {
+            data[len] = '\0';
+            // El CommandManager procesa y nosotros solo imprimimos la respuesta
+            std::string response = CommandManager::execute((char*)data);
+            printf("%s\n", response.c_str());
+        }
+
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
