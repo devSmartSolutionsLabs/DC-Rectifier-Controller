@@ -35,7 +35,7 @@ bool MCP23017::write_register(uint8_t reg, uint8_t value) {
     i2c_cmd_link_delete(cmd);
     
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Error escritura reg 0x%02X: %d", reg, ret);
+        // ESP_LOGE(TAG, "Error escritura reg 0x%02X: %d", reg, ret); //(Comentado para reducir logs)
         return false;
     }
     return true;
@@ -55,7 +55,7 @@ bool MCP23017::read_register(uint8_t reg, uint8_t& value) {
     i2c_cmd_link_delete(cmd);
     
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Error lectura reg 0x%02X: %d", reg, ret);
+        //ESP_LOGE(TAG, "Error lectura reg 0x%02X: %d", reg, ret); //(Comentado para reducir logs)
         return false;
     }
     return true;
