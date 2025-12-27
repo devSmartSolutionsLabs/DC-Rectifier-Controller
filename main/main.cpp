@@ -711,6 +711,13 @@ extern "C" void app_main(void) {
         ESP_LOGI(TAG, "LoggerFS inicializado correctamente.");
     }
     
+    struct stat st;
+    if (stat("/spiffs", &st) == 0) {
+        ESP_LOGI("VERIFICACION", "La ruta /spiffs existe y es accesible.");
+    } else {
+        ESP_LOGE("VERIFICACION", "La ruta /spiffs NO existe en el VFS.");
+    }
+
     // Primero inicializar los componentes de red/memoria
     WifiManager::init();
 
@@ -767,6 +774,13 @@ extern "C" void app_main(void) {
         ESP_LOGW(TAG, "Error agregando tarea principal al WDT.");
     }
     
+    // 3. Inicializa el driver del puerto nativo para permitir lectura
+    usb_serial_jtag_driver_config_t usb_serial_jtag_config = {
+        .tx_buffer_size = 256,
+        .rx_buffer_size = 256,
+    };
+    usb_serial_jtag_driver_install(&usb_serial_jtag_config);
+
     // 4. HARDWARE: MCP23017 Y BUS I2C
     initialize_mcp_enables();
 
@@ -854,19 +868,20 @@ extern "C" void app_main(void) {
             loop_counter = 0; 
         }
 
-        // 1. LECTURA POR PUERTO USB NATIVO
+        // LECTURA POR PUERTO USB NATIVO (Pines 19 y 20)
         uint8_t n_buf[64];
-        // Leemos del buffer USB (no bloqueante)
+        // Usamos un timeout de 0 para no bloquear el resto del sistema
         int len = usb_serial_jtag_read_bytes(n_buf, sizeof(n_buf), 0);
         
         if (len > 0) {
             for (int i = 0; i < len; i++) {
                 char c = (char)n_buf[i];
                 
+                // Procesar al recibir Enter
                 if (c == '\n' || c == '\r') {
                     if (!acumulador_serie.empty()) {
                         std::string respuesta = CommandManager::execute(acumulador_serie);
-                        // IMPORTANTE: Para el puerto nativo, usamos printf o usb_serial_jtag_write_bytes
+                        // Usamos printf, que ya está ruteado al USB nativo por defecto
                         printf("\r\n%s\r\n> ", respuesta.c_str());
                         fflush(stdout); 
                         acumulador_serie.clear();
