@@ -723,7 +723,11 @@ extern "C" void app_main(void) {
 
     iniciar_sincronizacion_tiempo();
     // Registro inicial: BOOT
-    g_logger.registrar(RectEvent::BOOT, obtener_estado_actual(), "Arranque del sistema v" CURRENT_VERSION);
+    g_logger.registrarEstructurado(
+                RectEvent::BOOT,            // Esto grabará 0x0100
+                "v" CURRENT_VERSION,        // Valor: "v3.0.3"
+                "Arranque del sistema"      // Nota
+            );
 
     if (WifiManager::connect_saved()) {
         ESP_LOGI(TAG, "Intentando conectar a red guardada...");
@@ -744,7 +748,8 @@ extern "C" void app_main(void) {
             ESP_LOGI(TAG, "Conexión exitosa. IP: %s", WifiManager::get_ip().c_str());
             
             // Intenta registrar con una nota estática (ocupa menos stack)
-            g_logger.registrar(RectEvent::NETWORK_ST, obtener_estado_actual(), "WiFi OK");
+            g_logger.registrarEstructurado(RectEvent::NET_SSID, WifiManager::get_ssid(), "Conectado");
+            g_logger.registrarEstructurado(RectEvent::NET_IP, WifiManager::get_ip(), "DHCP OK");
         }
     }
 
@@ -752,7 +757,11 @@ extern "C" void app_main(void) {
     if (!WifiManager::is_connected()) {
         ESP_LOGW(TAG, "Abriendo modo configuracion (Portal)");
         // REGISTRO: Modo Punto de Acceso activo
-        g_logger.registrar(RectEvent::NETWORK_ST, obtener_estado_actual(), "Portal AP Activo (192.168.4.1)");
+        g_logger.registrarEstructurado(
+                RectEvent::NET_AP_START,    // Definir como 0x0700
+                "192.168.4.1",             // Valor: La IP del portal
+                "Portal AP Activo"         // Nota
+            );
         WifiManager::start_ap();
         g_portal.start();
     }
@@ -791,7 +800,12 @@ extern "C" void app_main(void) {
     // Mutex
     g_i2c_mutex = xSemaphoreCreateMutex();
     if (g_i2c_mutex == NULL) {
-        g_logger.registrar(RectEvent::ERROR_HARDWARE, obtener_estado_actual(), "Fallo creacion Mutex I2C");
+        // Categoría 0x05 (Errores) | Evento 0x0503 (Error de Recurso/Mutex)
+        g_logger.registrarEstructurado(
+            RectEvent::ERR_SYSTEM,      // Definir como 0x0503
+            "I2C_MUTEX",               // Valor: El recurso que falló
+            "Fallo creacion Mutex I2C" // Nota
+        );
         ESP_LOGE(TAG, "Error creando mutex I2C");
         return;
     }
@@ -808,7 +822,12 @@ extern "C" void app_main(void) {
     g_ads = new ADS1115(I2C_PORT, 0x48, g_i2c_mutex);
     if (!g_ads->begin()) {
         ESP_LOGE(TAG, "Error inicializando ADS1115");
-        g_logger.registrar(RectEvent::ERROR_HARDWARE, obtener_estado_actual(), "ADS1115 no detectado");
+        // Categoría 0x05 (Errores) | Evento 0x0501 (Error de Dispositivo I2C)
+        g_logger.registrarEstructurado(
+            RectEvent::ERR_I2C,         // Definir como 0x0501
+            "ADS1115",                 // Valor: ID del chip no detectado
+            "Sensor no detectado"      // Nota
+        );
     }
 
     g_mcp = new MCP23017(I2C_PORT, 0x27);
@@ -827,7 +846,7 @@ extern "C" void app_main(void) {
         ESP_LOGI(TAG, "MCP23017 configurado");
     } else {
         ESP_LOGE(TAG, "Error inicializando MCP23017");
-        g_logger.registrar(RectEvent::ERROR_HARDWARE, obtener_estado_actual(), "MCP23017 no detectado");
+        g_logger.registrarEstructurado(RectEvent::ERR_I2C, "MCP23017", "Fallo de inicializacion");
     }
 
     g_ina = new INA226(I2C_PORT_1, 0x40, g_i2c_mutex);
@@ -854,7 +873,10 @@ extern "C" void app_main(void) {
     }
 
     ESP_LOGI(TAG, "Sistema listo. Esperando comando START...");
-    g_logger.registrar(RectEvent::CONFIG_CHANGE, obtener_estado_actual(), "Hardware Listo - Esperando Operario");
+    g_logger.registrarEstructurado(RectEvent::CONFIG_CHANGE,   // Esto grabará 0x0600 (o el sub-ID que definas)
+                                    "READY",                    // El valor específico
+                                    "Hardware Listo - Esperando Operario" // La nota descriptiva
+            );
 
     ESP_LOGI(TAG, "Mapeo Pot: %.0f mV-%.0f mV -> 0A-%.0fA (%.0f pasos, %.1f us/paso) | Max Delay Seguro: %lu us",
              POT_MIN_MV, POT_MAX_MV, MAX_CURRENT_A, NUM_POINTS_F, DELAY_STEP_US, SAFE_MAX_DELAY_US);
