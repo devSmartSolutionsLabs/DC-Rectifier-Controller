@@ -25,4 +25,6 @@ idf_component_register(
         json                # Este es cJSON
         esp-tls             # <--- ESTE habilita esp_crt_bundle.h
         mbedtls             # <--- Requerido para el motor de cifrado
+        spiffs 
+        esp_partition
 )
