@@ -21,12 +21,10 @@ std::string CommandManager::execute(std::string cmd) {
     if (cmd == "log.show") {
         return dumpLogs();
     } 
+    // Dentro de CommandManager::execute
     else if (cmd == "log.clear") {
-        // Podríamos inyectar una instancia global de LoggerFS aquí
-        // Suponiendo que g_logger es global
-        extern LoggerFS g_logger;
-        g_logger.limpiarLog();
-        return "SUCCESS: Historial de logs borrado.";
+        g_logger.limpiarLog(); 
+        return "SUCCESS: Historial reiniciado. Registro de borrado generado.";
     }
     else if (cmd == "stats") {
         return getSystemStats();
