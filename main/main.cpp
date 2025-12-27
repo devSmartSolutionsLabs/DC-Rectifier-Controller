@@ -20,6 +20,10 @@
 #include "GitHubClient.hpp"
 #include "PortalWeb.hpp"
 #include "esp_ota_ops.h" // Necesario para consultar la descripción de la app
+#include "LoggerFS.hpp"
+#include "esp_sntp.h" // Necesario para la hora de Lima
+
+
 
 #define CURRENT_VERSION "3.0.2"
 float g_corriente_actual = 0.0f;
@@ -105,6 +109,18 @@ static ADS1115* g_ads = nullptr;
 static MCP23017* g_mcp = nullptr;
 static INA226* g_ina = nullptr;
 
+// Instancia Global del Logger
+static LoggerFS g_logger("/spiffs");
+
+RectStatus obtener_estado_actual() {
+    RectStatus status;
+    // Mapeamos la dirección según los relays de dirección
+    status.direction = a2_on ? RectDirection::FORWARD : RectDirection::REVERSE;
+    status.current   = g_corriente_actual;
+    status.voltage   = (float)g_potenciometro_mv; 
+    status.temp      = 0; // Placeholder por ahora
+    return status;
+}
 // === Estructura por Fase ===
 typedef struct {
     gptimer_handle_t timer;
@@ -669,6 +685,18 @@ static void initialize_mcp_enables() {
     ESP_LOGI(TAG, "Enables MCP: GPIO15=1 GPIO41=1");
 }
 
+void iniciar_sincronizacion_tiempo() {
+    ESP_LOGI(TAG, "Configurando SNTP para Lima, Peru...");
+    sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    sntp_setservername(0, "pool.ntp.org");
+    sntp_setservername(1, "south-america.pool.ntp.org");
+    sntp_init();
+
+    // Lima no tiene horario de verano, es UTC-5 fijo
+    setenv("TZ", "PET5", 1); 
+    tzset();
+}
+
 extern "C" void app_main(void) {
     const esp_app_desc_t *app_desc = esp_app_get_description();    
     ESP_LOGI("SISTEMA", "##########################################");
@@ -676,9 +704,14 @@ extern "C" void app_main(void) {
     ESP_LOGI("SISTEMA", " VERSION : %s", app_desc->version); // Aquí saldrá "3.0.1"
     ESP_LOGI("SISTEMA", " COMPILADO: %s %s", app_desc->date, app_desc->time);
     ESP_LOGI("SISTEMA", "##########################################");
-
+    
+    if (g_logger.begin()) {
+        ESP_LOGI(TAG, "LoggerFS inicializado correctamente.");
+    }
+    iniciar_sincronizacion_tiempo();
+    // Registro inicial: BOOT
+    g_logger.registrar(RectEvent::BOOT, obtener_estado_actual(), "Arranque del sistema v" CURRENT_VERSION);
     // Primero inicializar los componentes de red/memoria
-    // En app_main:
     WifiManager::init();
 
     if (WifiManager::connect_saved()) {
@@ -687,7 +720,15 @@ extern "C" void app_main(void) {
         // Esperar hasta 15 segundos o hasta que falle definitivamente
         for(int i = 0; i < 150; i++) {
             vTaskDelay(pdMS_TO_TICKS(100));
-            if (WifiManager::is_connected()) break;
+            if (WifiManager::is_connected()) {
+                // REGISTRO: Conexión exitosa con detalles de red
+                char wifi_info[64];
+                snprintf(wifi_info, sizeof(wifi_info), "Conectado SSID:%s IP:%s", 
+                         WifiManager::get_ssid().c_str(), 
+                         WifiManager::get_ip().c_str());
+                g_logger.registrar(RectEvent::NETWORK_ST, obtener_estado_actual(), wifi_info);
+                break;
+            }
             if (WifiManager::should_fallback()) break;
         }
     }
@@ -695,6 +736,8 @@ extern "C" void app_main(void) {
     // Si no hay red guardada, o si fallaron los reintentos:
     if (!WifiManager::is_connected()) {
         ESP_LOGW(TAG, "Abriendo modo configuracion (Portal)");
+        // REGISTRO: Modo Punto de Acceso activo
+        g_logger.registrar(RectEvent::NETWORK_ST, obtener_estado_actual(), "Portal AP Activo (192.168.4.1)");
         WifiManager::start_ap();
         g_portal.start();
     }
@@ -727,6 +770,7 @@ extern "C" void app_main(void) {
     // Mutex
     g_i2c_mutex = xSemaphoreCreateMutex();
     if (g_i2c_mutex == NULL) {
+        g_logger.registrar(RectEvent::ERROR_HARDWARE, obtener_estado_actual(), "Fallo creacion Mutex I2C");
         ESP_LOGE(TAG, "Error creando mutex I2C");
         return;
     }
@@ -743,6 +787,7 @@ extern "C" void app_main(void) {
     g_ads = new ADS1115(I2C_PORT, 0x48, g_i2c_mutex);
     if (!g_ads->begin()) {
         ESP_LOGE(TAG, "Error inicializando ADS1115");
+        g_logger.registrar(RectEvent::ERROR_HARDWARE, obtener_estado_actual(), "ADS1115 no detectado");
     }
 
     g_mcp = new MCP23017(I2C_PORT, 0x27);
@@ -761,6 +806,7 @@ extern "C" void app_main(void) {
         ESP_LOGI(TAG, "MCP23017 configurado");
     } else {
         ESP_LOGE(TAG, "Error inicializando MCP23017");
+        g_logger.registrar(RectEvent::ERROR_HARDWARE, obtener_estado_actual(), "MCP23017 no detectado");
     }
 
     g_ina = new INA226(I2C_PORT_1, 0x40, g_i2c_mutex);
@@ -787,6 +833,8 @@ extern "C" void app_main(void) {
     }
 
     ESP_LOGI(TAG, "Sistema listo. Esperando comando START...");
+    g_logger.registrar(RectEvent::CONFIG_CHANGE, obtener_estado_actual(), "Hardware Listo - Esperando Operario");
+    
     ESP_LOGI(TAG, "Mapeo Pot: %.0f mV-%.0f mV -> 0A-%.0fA (%.0f pasos, %.1f us/paso) | Max Delay Seguro: %lu us",
              POT_MIN_MV, POT_MAX_MV, MAX_CURRENT_A, NUM_POINTS_F, DELAY_STEP_US, SAFE_MAX_DELAY_US);
 
