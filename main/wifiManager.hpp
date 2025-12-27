@@ -5,7 +5,6 @@
 #include "esp_netif.h"
 #include "nvs_flash.h"
 
-// Variable global para pausar procesos ruidosos durante el escaneo
 extern volatile bool g_is_wifi_scanning;
 
 class WifiManager {
@@ -16,5 +15,9 @@ public:
     static std::string scan_to_json();
     static void save_and_reconnect(std::string ssid, std::string pass);
     static bool is_connected();
-    static bool should_fallback(); // <-- Añadida para resolver el error de compilación
+    static bool should_fallback();
+    
+    // --- NUEVOS MÉTODOS PARA EL LOGGER ---
+    static std::string get_ssid();
+    static std::string get_ip();
 };

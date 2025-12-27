@@ -180,3 +180,28 @@ void WifiManager::start_ap() {
     esp_wifi_start();
     ESP_LOGI(TAG, "Portal AP listo en 192.168.4.1");
 }
+
+// Añade estos métodos al final de tu archivo wifiManager.cpp
+
+std::string WifiManager::get_ssid() {
+    wifi_config_t conf;
+    // Obtenemos la configuración actual de la interfaz Station
+    esp_err_t res = esp_wifi_get_config(WIFI_IF_STA, &conf);
+    if (res == ESP_OK) {
+        return std::string((char*)conf.sta.ssid);
+    }
+    return "Desconocido";
+}
+
+std::string WifiManager::get_ip() {
+    esp_netif_ip_info_t ip_info;
+    // Obtenemos el handle de la interfaz por defecto de la estación
+    esp_netif_t* netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    
+    if (netif && esp_netif_get_ip_info(netif, &ip_info) == ESP_OK) {
+        char buf[16];
+        esp_ip4addr_ntoa(&ip_info.ip, buf, sizeof(buf));
+        return std::string(buf);
+    }
+    return "0.0.0.0";
+}
