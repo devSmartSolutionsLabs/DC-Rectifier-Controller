@@ -497,7 +497,7 @@ static void button_task(void* arg) {
         // LLAMADA REPETIDA: Resetear el WDT para indicar actividad
         esp_task_wdt_reset();
         read_buttons();
-        vTaskDelay(pdMS_TO_TICKS(20));
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
 
@@ -852,10 +852,16 @@ extern "C" void app_main(void) {
              POT_MIN_MV, POT_MAX_MV, MAX_CURRENT_A, NUM_POINTS_F, DELAY_STEP_US, SAFE_MAX_DELAY_US);
 
     // Loop principal
+
+    uint32_t loop_counter = 0;
     while (true) {
         esp_task_wdt_reset();
         update_phases_enable();
-        g_scr_activo = g_scr_enabled;
+        if (loop_counter++ >= 10) {
+            update_phases_enable();
+            g_scr_activo = g_scr_enabled;
+            loop_counter = 0; 
+        }
 
         // Leer Serial
         uint8_t data[256];
@@ -867,6 +873,6 @@ extern "C" void app_main(void) {
             printf("%s\n", response.c_str());
         }
 
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
