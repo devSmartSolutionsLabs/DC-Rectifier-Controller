@@ -7,6 +7,7 @@ idf_component_register(
         "WifiManager.cpp"
         "GitHubClient.cpp"
         "PortalWeb.cpp"
+        "LoggerFS.cpp"
     INCLUDE_DIRS "."
     EMBED_TXTFILES "github_root_ca.pem"
     REQUIRES 
