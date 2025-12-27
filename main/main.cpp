@@ -27,7 +27,7 @@
 #include "driver/usb_serial_jtag.h" // Asegúrate de incluir esta cabecera
 #include "CommandManager.hpp"
 
-#define CURRENT_VERSION "3.0.2"
+#define CURRENT_VERSION "3.0.3"
 float g_corriente_actual = 0.0f;
 int g_potenciometro_mv = 0;
 bool g_scr_activo = false;
@@ -728,19 +728,23 @@ extern "C" void app_main(void) {
     if (WifiManager::connect_saved()) {
         ESP_LOGI(TAG, "Intentando conectar a red guardada...");
         
-        // Esperar hasta 15 segundos o hasta que falle definitivamente
+        bool conectado = false;
         for(int i = 0; i < 150; i++) {
             vTaskDelay(pdMS_TO_TICKS(100));
             if (WifiManager::is_connected()) {
-                // REGISTRO: Conexión exitosa con detalles de red
-                char wifi_info[64];
-                snprintf(wifi_info, sizeof(wifi_info), "Conectado SSID:%s IP:%s", 
-                         WifiManager::get_ssid().c_str(), 
-                         WifiManager::get_ip().c_str());
-                g_logger.registrar(RectEvent::NETWORK_ST, obtener_estado_actual(), wifi_info);
+                conectado = true;
                 break;
             }
             if (WifiManager::should_fallback()) break;
+        }
+
+        if (conectado) {
+            // En lugar de registrar inmediatamente, podrías usar un flag
+            // o imprimir un log simple primero para ver si sobrevive
+            ESP_LOGI(TAG, "Conexión exitosa. IP: %s", WifiManager::get_ip().c_str());
+            
+            // Intenta registrar con una nota estática (ocupa menos stack)
+            g_logger.registrar(RectEvent::NETWORK_ST, obtener_estado_actual(), "WiFi OK");
         }
     }
 
