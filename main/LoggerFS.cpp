@@ -100,6 +100,26 @@ void LoggerFS::registrar(RectEvent evento, const RectStatus& status, const std::
 
 void LoggerFS::limpiarLog() {
     std::lock_guard<std::mutex> lock(_mutex);
-    writeHeader();
-    ESP_LOGI(TAG, "Log reiniciado.");
+    
+    // 1. Recreamos el encabezado (esto borra el contenido previo)
+    writeHeader(); 
+
+    // 2. Registramos el rastro del borrado
+    FILE* f = fopen(_full_path.c_str(), "a");
+    if (f) {
+        // Cambiamos el 0 por 0UL para que coincida con %lu
+        fprintf(f, "%s,%u,%u,%.2f,%.2f,%lu,%s\n", 
+                getLimaTimestamp().c_str(),
+                static_cast<uint8_t>(RectEvent::CONFIG_CHANGE), 
+                0,      // Dir (uint8_t)
+                0.0,    // Amps (float)
+                0.0,    // Volts (float)
+                0UL,    // Temp (uint32_t -> requiere UL para %lu)
+                "LOG_CLEARED: El historial fue reiniciado por el usuario.");
+        
+        fsync(fileno(f));
+        fclose(f);
+    }
+    
+    ESP_LOGW(TAG, "Historial reiniciado. Se ha dejado rastro de la accion.");
 }
