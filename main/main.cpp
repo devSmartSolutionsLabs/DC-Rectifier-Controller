@@ -24,6 +24,7 @@
 #include "esp_sntp.h" // Necesario para la hora de Lima
 
 #include "driver/uart.h"
+#include "driver/usb_serial_jtag.h" // Asegúrate de incluir esta cabecera
 #include "CommandManager.hpp"
 
 #define CURRENT_VERSION "3.0.2"
@@ -766,17 +767,6 @@ extern "C" void app_main(void) {
         ESP_LOGW(TAG, "Error agregando tarea principal al WDT.");
     }
     
-    uart_config_t uart_config = {
-        .baud_rate = 115200,
-        .data_bits = UART_DATA_8_BITS,
-        .parity = UART_PARITY_DISABLE,
-        .stop_bits = UART_STOP_BITS_1,
-        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
-        .source_clk = UART_SCLK_DEFAULT,
-    };
-    uart_driver_install(UART_NUM_0, 1024, 0, 0, NULL, 0);
-    uart_param_config(UART_NUM_0, &uart_config);
-
     // 4. HARDWARE: MCP23017 Y BUS I2C
     initialize_mcp_enables();
 
@@ -854,6 +844,7 @@ extern "C" void app_main(void) {
     // Loop principal
 
     uint32_t loop_counter = 0;
+    static std::string acumulador_serie = "";
     while (true) {
         esp_task_wdt_reset();
         update_phases_enable();
@@ -863,14 +854,27 @@ extern "C" void app_main(void) {
             loop_counter = 0; 
         }
 
-        // Leer Serial
-        uint8_t data[256];
-        int len = uart_read_bytes(UART_NUM_0, data, sizeof(data)-1, pdMS_TO_TICKS(50));
+        // 1. LECTURA POR PUERTO USB NATIVO
+        uint8_t n_buf[64];
+        // Leemos del buffer USB (no bloqueante)
+        int len = usb_serial_jtag_read_bytes(n_buf, sizeof(n_buf), 0);
+        
         if (len > 0) {
-            data[len] = '\0';
-            // El CommandManager procesa y nosotros solo imprimimos la respuesta
-            std::string response = CommandManager::execute((char*)data);
-            printf("%s\n", response.c_str());
+            for (int i = 0; i < len; i++) {
+                char c = (char)n_buf[i];
+                
+                if (c == '\n' || c == '\r') {
+                    if (!acumulador_serie.empty()) {
+                        std::string respuesta = CommandManager::execute(acumulador_serie);
+                        // IMPORTANTE: Para el puerto nativo, usamos printf o usb_serial_jtag_write_bytes
+                        printf("\r\n%s\r\n> ", respuesta.c_str());
+                        fflush(stdout); 
+                        acumulador_serie.clear();
+                    }
+                } else {
+                    acumulador_serie += c;
+                }
+            }
         }
 
         vTaskDelay(pdMS_TO_TICKS(100));
