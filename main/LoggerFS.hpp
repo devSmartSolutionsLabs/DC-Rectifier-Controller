@@ -4,6 +4,7 @@
 #include <string>
 #include <mutex>
 #include <time.h>
+#include <algorithm>
 
 enum class RectDirection : uint8_t { FORWARD = 0, REVERSE = 1 };
 
@@ -14,7 +15,7 @@ enum class RectEvent : uint8_t {
     INTERRUPTION   = 0x04,
     ERROR_HARDWARE = 0x05,
     CONFIG_CHANGE  = 0x06,
-    NETWORK_ST     = 0x07  // Estado de Red (Conexión/Desconexión)
+    NETWORK_ST     = 0x07 
 };
 
 struct RectStatus {
@@ -27,19 +28,17 @@ struct RectStatus {
 class LoggerFS {
 public:
     explicit LoggerFS(const char* base_path);
-    
-    // Inicializa el sistema y verifica rotación/encabezados
     bool begin(); 
-
     void registrar(RectEvent evento, const RectStatus& status, const std::string& nota = "");
     void limpiarLog();
     std::string getFilePath() const { return _full_path; }
 
 private:
+    std::string _base_path;
     std::string _full_path;
     std::string _old_path;
     std::mutex _mutex;
-    const size_t MAX_LOG_SIZE = 500 * 1024; // 500 KB limite
+    const size_t MAX_LOG_SIZE = 500 * 1024; // 500 KB
 
     std::string getLimaTimestamp();
     void checkRotation();
