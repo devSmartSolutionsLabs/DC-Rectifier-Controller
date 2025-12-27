@@ -178,7 +178,18 @@ static const char* root_html = R"rawliteral(
 }
 </script></body></html>
 )rawliteral";
-
+std::string urlDecode(std::string str) {
+    std::string res;
+    for (size_t i = 0; i < str.length(); ++i) {
+        if (str[i] == '+') res += ' ';
+        else if (str[i] == '%' && i + 2 < str.length()) {
+            char hex[3] = { str[i+1], str[i+2], '\0' };
+            res += (char)strtol(hex, nullptr, 16);
+            i += 2;
+        } else res += str[i];
+    }
+    return res;
+}
 // --- TAREA DE TELEMETRÍA (INDIFERENTE A LA PESTAÑA ABIERTA) ---
 void send_telemetry_task(void* pv) {
     while(1) {
@@ -322,10 +333,19 @@ esp_err_t PortalWeb::start() {
         static httpd_uri_t uri_wifi = {};
         uri_wifi.uri = "/setwifi"; uri_wifi.method = HTTP_POST;
         uri_wifi.handler = [](httpd_req_t *req){
-            char b[256]; int r = httpd_req_recv(req, b, req->content_len); if(r<=0) return ESP_FAIL; b[r]=0;
-            std::string d(b); size_t s_p=d.find("ssid="), p_p=d.find("&pass=");
-            if(s_p!=std::string::npos && p_p!=std::string::npos){
-                WifiManager::save_and_reconnect(d.substr(s_p+5, p_p-(s_p+5)), d.substr(p_p+6));
+            char b[256]; 
+            int r = httpd_req_recv(req, b, req->content_len); 
+            if(r <= 0) return ESP_FAIL; 
+            b[r] = 0;
+
+            std::string d(b); 
+            size_t s_p = d.find("ssid="), p_p = d.find("&pass=");
+            if(s_p != std::string::npos && p_p != std::string::npos){
+                // DECODIFICAMOS antes de guardar
+                std::string raw_ssid = d.substr(s_p + 5, p_p - (s_p + 5));
+                std::string raw_pass = d.substr(p_p + 6);
+                
+                WifiManager::save_and_reconnect(urlDecode(raw_ssid), urlDecode(raw_pass));
             }
             return httpd_resp_sendstr(req, "WiFi configurado");
         };
