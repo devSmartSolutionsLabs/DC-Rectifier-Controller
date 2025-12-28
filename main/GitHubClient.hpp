@@ -13,7 +13,7 @@ class GitHubClient {
 public:
     // Obtiene la lista de versiones y decide si son nuevas
     static std::vector<ReleaseInfo> get_releases(const char* repo);
-    
+    static std::string get_releases_json();
     // Inicia la tarea de actualización OTA
     static void start_ota_from_url(const char* url);
     

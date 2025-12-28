@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>S3 Rectificador Pro - v{{VERSION}}</title>
+    <style>
+        :root {
+            --bg-color: #121212;
+            --card-bg: #1e1e1e;
+            --primary: #00ff00;
+            --secondary: #007bff;
+            --danger: #dc3545;
+            --text-main: #e0e0e0;
+            --text-dim: #888;
+            --border: #333;
+        }
+
+        body { 
+            font-family: 'Segoe UI', system-ui, sans-serif; 
+            background: var(--bg-color); 
+            color: var(--text-main); 
+            text-align: center; 
+            margin: 0; 
+            padding-bottom: 30px; 
+        }
+
+        /* Navegación */
+        .nav { 
+            display: flex; 
+            background: var(--card-bg); 
+            position: sticky; 
+            top: 0; 
+            border-bottom: 1px solid var(--border); 
+            z-index: 100; 
+        }
+        .nav button { 
+            flex: 1; 
+            padding: 15px; 
+            border: none; 
+            background: none; 
+            color: var(--text-dim); 
+            cursor: pointer; 
+            font-weight: bold; 
+            font-size: 11px; 
+            text-transform: uppercase;
+            transition: 0.3s;
+        }
+        .nav button.active { 
+            color: var(--primary); 
+            border-bottom: 3px solid var(--primary); 
+            background: #252525; 
+        }
+
+        .container { max-width: 500px; margin: 15px auto; padding: 15px; }
+        .card { 
+            background: var(--card-bg); 
+            padding: 20px; 
+            border-radius: 15px; 
+            border: 1px solid var(--border); 
+            margin-bottom: 15px; 
+        }
+
+        .tab-content { display: none; }
+        .tab-content.active { display: block; }
+
+        /* Monitor */
+        .val-box { display: flex; justify-content: space-around; margin-bottom: 15px; }
+        .val-num { font-size: 2.2em; color: var(--primary); font-family: 'Consolas', monospace; font-weight: bold; }
+        canvas { background: #000; width: 100%; border-radius: 10px; border: 1px solid #444; }
+
+        /* Auditoría (Logs) */
+        #log-view { 
+            background: #000; 
+            color: var(--primary); 
+            font-family: 'Consolas', 'Courier New', monospace; 
+            font-size: 11px; 
+            text-align: left; 
+            padding: 12px; 
+            border-radius: 8px; 
+            height: 400px; 
+            overflow-y: auto; 
+            border: 1px solid var(--border); 
+            white-space: pre-wrap;
+            word-break: break-all;
+        }
+        .log-controls { display: flex; gap: 10px; margin-bottom: 12px; }
+
+        /* Botones y Inputs */
+        .btn { 
+            background: var(--secondary); 
+            color: white; 
+            border: none; 
+            padding: 14px; 
+            border-radius: 8px; 
+            cursor: pointer; 
+            width: 100%; 
+            margin: 10px 0; 
+            font-weight: bold; 
+            transition: 0.2s;
+        }
+        .btn:active { transform: scale(0.98); }
+        .btn:hover { opacity: 0.9; }
+        
+        #networks { max-height: 180px; overflow-y: auto; background: #161616; margin: 10px 0; border-radius: 8px; text-align: left; border: 1px solid #222; }
+        .net-item { padding: 12px; border-bottom: 1px solid #222; cursor: pointer; display: flex; justify-content: space-between; }
+        
+        input { width: 92%; padding: 12px; margin: 5px 0; background: #2a2a2a; color: white; border: 1px solid #444; border-radius: 5px; font-size: 16px; }
+
+        /* Utilidades */
+        .spinner { border: 3px solid rgba(255,255,255,.3); border-radius: 50%; border-top: 3px solid var(--primary); width: 16px; height: 16px; animation: spin 1s linear infinite; display: inline-block; vertical-align: middle; }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+        .new-badge { background: var(--primary); color: #000; font-size: 0.7em; padding: 2px 5px; border-radius: 4px; font-weight: bold; }
+    </style>
+</head>
+<body>
+
+    <header style="margin-top: 20px;">
+        <h2 style="margin: 0; color: var(--primary);">{{TITULO_EQUIPO}}</h2>
+        <small style="color: var(--text-dim);">Versión de Control: v{{VERSION}}</small>
+    </header>
+
+    <nav class="nav">
+        <button id="t-dash" class="active" onclick="tab('dash')">Monitor</button>
+        <button id="t-logs" onclick="tab('logs'); fetchLogs();">Auditoría</button>
+        <button id="t-sys" onclick="tab('sys')">Sistema / OTA</button>
+    </nav>
+
+    <main class="container">
+        <section id="dash" class="tab-content active">
+            <div class="card">
+                <div class="val-box">
+                    <div><small style="color:var(--text-dim)">CORRIENTE</small><div id="v-amp" class="val-num">0.0A</div></div>
+                    <div><small style="color:var(--text-dim)">CONSIGNA</small><div id="v-pot" class="val-num">0mV</div></div>
+                </div>
+                <canvas id="chart" height="180"></canvas>
+                <div id="v-scr" style="margin-top:15px; font-family: monospace; font-weight: bold;">SCR: ---</div>
+            </div>
+        </section>
+
+        <section id="logs" class="tab-content">
+            <div class="card">
+                <div class="log-controls">
+                    <button class="btn" style="margin:0; flex:2;" onclick="fetchLogs()">🔄 REFRESCAR</button>
+                    <button class="btn" style="margin:0; flex:1; background:var(--danger);" onclick="clearLogs()">🗑️ LIMPIAR</button>
+                </div>
+                <div id="log-view">Cargando registros...</div>
+            </div>
+        </section>
+
+        <section id="sys" class="tab-content">
+            <div class="card">
+                <h4 style="text-align:left; margin:0 0 10px 0; font-size:12px; color:var(--text-dim)">WIFI MANAGER</h4>
+                <button class="btn" onclick="scan()">BUSCAR REDES</button>
+                <div id="networks"></div>
+                <input type="text" id="ssid" placeholder="SSID Red">
+                <input type="password" id="pass" placeholder="Contraseña">
+                <button class="btn" style="background:#28a745" onclick="connect()">GUARDAR Y REINICIAR</button>
+                <hr>
+                <h4 style="text-align:left; margin:0 0 10px 0; font-size:12px; color:var(--text-dim)">ACTUALIZACIÓN GITHUB</h4>
+                <button class="btn" style="background:#6f42c1" onclick="fetchReleases()">VERIFICAR FIRMWARE</button>
+                <div id="releases-list"></div>
+            </div>
+        </section>
+    </main>
+
+    <footer style="font-size: 0.75em; color: var(--text-dim); margin-top: 20px;">
+        ID Hardware: ESP32-S3 Industrial Rectifier
+    </footer>
+
+    <script>
+        // Navegación
+        function tab(id){
+            document.querySelectorAll('.tab-content').forEach(t=>t.classList.remove('active'));
+            document.querySelectorAll('.nav button').forEach(b=>b.classList.remove('active'));
+            document.getElementById(id).classList.add('active');
+            document.getElementById('t-'+id).classList.add('active');
+        }
+
+        // --- GESTIÓN DE LOGS ---
+        function fetchLogs() {
+            const view = document.getElementById('log-view');
+            fetch('/get-logs')
+                .then(r => r.text())
+                .then(txt => {
+                    view.textContent = txt || "Log vacío.";
+                    view.scrollTop = view.scrollHeight;
+                })
+                .catch(() => view.textContent = "Error de comunicación con SPIFFS.");
+        }
+
+        function clearLogs() {
+            if(confirm("¿Eliminar historial definitivo?")) {
+                fetch('/clear-logs', {method: 'POST'}).then(() => fetchLogs());
+            }
+        }
+
+        // --- WEBSOCKET ---
+        let dataPoints = Array(60).fill(0);
+        let canvas = document.getElementById('chart');
+        let ctx = canvas.getContext('2d');
+        let ws = new WebSocket(`ws://${location.host}/ws`);
+
+        ws.onmessage = (e) => {
+            let d = JSON.parse(e.data);
+            document.getElementById('v-amp').innerText = d.amp.toFixed(1) + "A";
+            document.getElementById('v-pot').innerText = d.pot + "mV";
+            document.getElementById('v-scr').innerText = "SCR: " + (d.scr ? "ACTIVO" : "INACTIVO");
+            document.getElementById('v-scr').style.color = d.scr ? "#00ff00" : "#ff4444";
+            dataPoints.push(d.amp); dataPoints.shift(); 
+            draw();
+        };
+
+        function draw() {
+            ctx.clearRect(0,0,canvas.width,canvas.height);
+            ctx.strokeStyle='#00ff00'; ctx.lineWidth=2; ctx.beginPath();
+            dataPoints.forEach((p,i)=>{
+                let x=(i/59)*canvas.width; 
+                let y=canvas.height-(p/5000*canvas.height);
+                if(i===0)ctx.moveTo(x,y); else ctx.lineTo(x,y);
+            }); ctx.stroke();
+        }
+
+        // --- WIFI & OTA ---
+        function scan(){
+            fetch('/scan').then(r=>r.json()).then(data=>{
+                let d=document.getElementById('networks'); d.innerHTML="";
+                data.forEach(n=>{
+                    let i=document.createElement('div'); i.className='net-item';
+                    i.innerHTML=`<span>${n.s}</span><span>${n.r}dBm</span>`;
+                    i.onclick=()=>{ document.getElementById('ssid').value=n.s; };
+                    d.appendChild(i);
+                });
+            });
+        }
+
+        function connect(){
+            const s = document.getElementById('ssid').value;
+            const p = document.getElementById('pass').value;
+            if(!s) return alert("Seleccione una red");
+            fetch('/setwifi', {method:'POST', body: `ssid=${encodeURIComponent(s)}&pass=${encodeURIComponent(p)}`})
+            .then(() => alert("Credenciales guardadas. Reiniciando..."));
+        }
+
+        function fetchReleases(){
+            fetch('/list-releases').then(r=>r.json()).then(data=>{
+                let l=document.getElementById('releases-list'); l.innerHTML="";
+                data.forEach(r=>{
+                    let d=document.createElement('div');
+                    d.style="display:flex;justify-content:space-between;padding:12px;background:#252525;margin-top:8px;border-radius:8px;align-items:center;border:1px solid #333;";
+                    d.innerHTML=`<div style='text-align:left'><b>${r.tag}</b> ${r.new?"<span class='new-badge'>NUEVA</span>":""}</div>
+                                 <button class="btn" style="width:auto;margin:0;padding:8px 12px;font-size:11px;" onclick="doUpdate('${r.bin_url}')">INSTALAR</button>`;
+                    l.appendChild(d);
+                });
+            });
+        }
+
+        function doUpdate(url) {
+            if(confirm("¿Iniciar OTA?")) {
+                event.target.innerHTML = "<span class='spinner'></span>";
+                fetch('/do-update?url=' + encodeURIComponent(url))
+                .then(r => r.ok ? alert("Actualizando...") : alert("Error"));
+            }
+        }
+    </script>
+</body>
+</html>

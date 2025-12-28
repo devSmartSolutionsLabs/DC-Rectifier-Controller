@@ -16,8 +16,10 @@ enum class RectEvent : uint16_t {
     HEARTBEAT       = 0x0103,  // Pulso periódico de vida
 
     // CATEGORIA 02: PROCESO (POTENCIA)
-    PROCESS_START   = 0x0200,
-    PROCESS_STOP    = 0x0201,
+    BTN_START_PRESS   = 0x0210, // Botón presionado
+    BTN_START_RELEASE = 0x0211, // Botón liberado
+    PROCESS_START     = 0x0200, // Proceso de potencia realmente activado
+    PROCESS_STOP      = 0x0201,  // Proceso de potencia desactivado
     POT_CHANGE      = 0x0202, // Cambio de potenciómetro
 
     // CATEGORIA 05: ERRORES

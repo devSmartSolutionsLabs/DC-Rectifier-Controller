@@ -10,7 +10,9 @@ idf_component_register(
         "LoggerFS.cpp"
         "CommandManager.cpp"
     INCLUDE_DIRS "."
-    EMBED_TXTFILES "github_root_ca.pem"
+    EMBED_TXTFILES 
+        "github_root_ca.pem" 
+        "index.html"
     REQUIRES 
         driver 
         freertos 

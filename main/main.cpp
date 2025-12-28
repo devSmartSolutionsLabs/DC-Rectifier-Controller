@@ -184,6 +184,11 @@ static void read_buttons() {
     if (b0_pressed) {
         if (!last_b0) {
             ESP_LOGI(TAG, "Start pressed");
+            g_logger.registrarEstructurado(
+                RectEvent::BTN_START_PRESS, 
+                "START PRESSED", 
+                "Arranque confirmado"
+            );
         }
         
         start_hold_ms += dt;
@@ -193,6 +198,7 @@ static void read_buttons() {
             g_scr_enabled = true;
             step1_done = true;
             ESP_LOGI(TAG, "STEP1: A0 ON + SCR habilitados");
+            g_logger.registrarEstructurado(RectEvent::PROCESS_START, "SCR_ON", "Etapa 1: Relays y SCR habilitados");
             control_relays();
         }
         
@@ -201,16 +207,22 @@ static void read_buttons() {
             set_direction(!b1_pressed);  // Invertido según tu lógica
             step2_done = true;
             ESP_LOGI(TAG, "STEP2: A1 ON + Dirección fijada");
+            if(b1_pressed)  g_logger.registrarEstructurado(RectEvent::PROCESS_START, "FORWARD", "Etapa 2: Direccion fijada");
+            else g_logger.registrarEstructurado(RectEvent::PROCESS_START, "REVERSE", "Etapa 2: Direccion fijada");
             control_relays();
         }
     } else {
-        if (last_b0 && (a0_on || a1_on || g_scr_enabled)) {
-            // Iniciar secuencia de apagado
-            a1_on = false;
-            g_scr_enabled = false;
-            shutting_down = true;
-            ESP_LOGI(TAG, "Iniciando apagado...");
-            control_relays();
+        if (last_b0){
+        g_logger.registrarEstructurado(RectEvent::BTN_START_RELEASE, "-", "Boton START liberado");        
+            if ((a0_on || a1_on || g_scr_enabled)) {
+                // Iniciar secuencia de apagado
+                a1_on = false;
+                g_scr_enabled = false;
+                shutting_down = true;
+                ESP_LOGI(TAG, "Iniciando apagado...");
+                g_logger.registrarEstructurado(RectEvent::PROCESS_STOP, "SHUTDOWN", "Iniciando secuencia de parada");
+                control_relays();
+            }
         }
         start_hold_ms = 0;
     }
@@ -750,6 +762,9 @@ extern "C" void app_main(void) {
             // Intenta registrar con una nota estática (ocupa menos stack)
             g_logger.registrarEstructurado(RectEvent::NET_SSID, WifiManager::get_ssid(), "Conectado");
             g_logger.registrarEstructurado(RectEvent::NET_IP, WifiManager::get_ip(), "DHCP OK");
+        }
+        else{
+            g_logger.registrarEstructurado(RectEvent::ERR_SYSTEM, "WIFI_TIMEOUT", "Fallo conexion a red guardada");
         }
     }
 

@@ -105,6 +105,31 @@ void GitHubClient::ota_task(void* pvParameter) {
     vTaskDelete(NULL);
 }
 
+std::string GitHubClient::get_releases_json() {
+    // 1. Obtener el vector de versiones usando el método que ya tienes
+    std::vector<ReleaseInfo> releases = GitHubClient::get_releases(REPO_PATH);
+    
+    // 2. Crear objeto raíz JSON (un array)
+    cJSON *root = cJSON_CreateArray();
+    
+    for (const auto& rel : releases) {
+        cJSON *item = cJSON_CreateObject();
+        cJSON_AddStringToObject(item, "tag", rel.tag.c_str());
+        cJSON_AddStringToObject(item, "bin_url", rel.bin_url.c_str());
+        cJSON_AddBoolToObject(item, "new", rel.is_new);
+        cJSON_AddItemToArray(root, item);
+    }
+    
+    // 3. Convertir a string y liberar memoria de cJSON
+    char *rendered = cJSON_PrintUnformatted(root);
+    std::string out(rendered);
+    
+    cJSON_Delete(root);
+    free(rendered);
+    
+    return out;
+}
+
 std::vector<ReleaseInfo> GitHubClient::get_releases(const char* repo) {
     std::vector<ReleaseInfo> list;
     
