@@ -19,10 +19,13 @@ extern const uint8_t index_html_end[]   asm("_binary_index_html_end");
 // Variables globales externas (main.cpp)
 extern float g_corriente_actual; 
 extern int g_potenciometro_mv;   
+
+int g_debug_adc_val = 0;  // Variable global que compartiremos con PortalWeb
+int ws_fd = -1; 
+
 extern "C" { extern volatile bool g_scr_enabled; }
 extern LoggerFS g_logger; 
 
-static int ws_fd = -1; 
 
 // Utilidad para decodificar caracteres especiales del WiFi (espacios, @, etc)
 std::string urlDecode(std::string str) {
@@ -39,14 +42,35 @@ std::string urlDecode(std::string str) {
     return res;
 }
 
+
+
 PortalWeb::PortalWeb() {}
+
+// Función para enviar datos en tiempo real sin bloquear el servidor
+void broadcast_debug_data(httpd_handle_t server) {
+    if (ws_fd == -1 || server == NULL) return;
+
+    char json[128];
+    // Enviamos un tipo "debug" para procesarlo independientemente en JS
+    snprintf(json, sizeof(json), "{\"type\":\"debug\",\"adc\":%d}", g_debug_adc_val);
+
+    httpd_ws_frame_t ws_pkt = {};
+    ws_pkt.payload = (uint8_t*)json;
+    ws_pkt.len = strlen(json);
+    ws_pkt.type = HTTPD_WS_TYPE_TEXT;
+
+    // Envío asíncrono: no espera a que el cliente reciba para seguir procesando
+    httpd_ws_send_frame_async(server, ws_fd, &ws_pkt);
+}
 
 esp_err_t PortalWeb::start() {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.lru_purge_enable = true;
     config.max_uri_handlers = 15; // Suficientes para todos los endpoints
     config.send_wait_timeout = 15;
+    config.recv_wait_timeout = 15; // Añadido para estabilidad
     config.stack_size = 10240;
+    config.task_priority = 10;      // Mayor prioridad para fluidez del portal
 
     ESP_LOGI(TAG, "Iniciando Servidor Web...");
 
@@ -79,16 +103,18 @@ esp_err_t PortalWeb::start() {
         };
         httpd_register_uri_handler(_server, &uri_root);
 
-        // --- 2. WEBSOCKET (Real-time data) ---
+        // --- HANDLER WEBSOCKET ---
         static httpd_uri_t uri_ws = {
             .uri = "/ws",
             .method = HTTP_GET,
             .handler = [](httpd_req_t *req) {
                 if (req->sess_ctx) return ESP_OK; 
                 ws_fd = httpd_req_to_sockfd(req);
+                ESP_LOGI("WS", "Cliente conectado: fd=%d", ws_fd);
                 return ESP_OK;
             },
-            .is_websocket = true
+            .is_websocket = true,
+            .handle_ws_control_frames = false // Silencia warning
         };
         httpd_register_uri_handler(_server, &uri_ws);
 
