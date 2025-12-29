@@ -20,13 +20,13 @@ static const char* TAG = "RECTIFICADOR";
 
 
 // === Configuración SCR ===
-static constexpr uint32_t PULSE_US       = 500;     // ANCHO DEL PULSO: 700 us
-static constexpr uint32_t DEBOUNCE_US    = 500;    // anti-rebote ZC (2.5 ms)
-static constexpr uint32_t DEFAULT_SEMI_PERIOD_US = 8333; // 60Hz
+static constexpr uint32_t PULSE_US       = 250;     // ANCHO DEL PULSO: 700 us
+static constexpr uint32_t DEBOUNCE_US    = 700;    // anti-rebote ZC (2.5 ms)
+static constexpr uint32_t DEFAULT_SEMI_PERIOD_US = 8150; // 60Hz
 
 // Pines 
 static const gpio_num_t ZC_PIN[3]  = { GPIO_NUM_38, GPIO_NUM_21, GPIO_NUM_14 };
-static const gpio_num_t SCR_PIN[3] = { GPIO_NUM_48, GPIO_NUM_47, GPIO_NUM_13 };
+static const gpio_num_t SCR_PIN[3] = { GPIO_NUM_48, GPIO_NUM_47, GPIO_NUM_43 };
 
 // === Configuración I2C ===
 static constexpr i2c_port_t I2C_PORT = I2C_NUM_0;
@@ -47,21 +47,21 @@ static constexpr float NUM_POINTS_F     = MAX_CURRENT_A / CURRENT_STEP_A; // 500
 static constexpr float DELAY_RANGE_US_F = NUM_POINTS_F * DELAY_STEP_US;   // 1000.0f * 6.0f = 6000.0f
 
 // Límites de Potenciómetro
-static constexpr float POT_MIN_MV       = 100.0f;  // Mínimo mapeado
+static constexpr float POT_MIN_MV       = 50.0f;  // Mínimo mapeado
 static constexpr float POT_MAX_MV       = 4000.0f;  // Máximo mapeado
 static constexpr float MV_RANGE         = POT_MAX_MV - POT_MIN_MV; 
 
 // --- NUEVAS CONSTANTES DE SEGURIDAD PARA EL POTENCIÓMETRO ---
-static constexpr float POT_DEADZONE_MV = 50.0f; // Si es menor a 150mV, forzar 0 Amperios
+static constexpr float POT_DEADZONE_MV = 40.0f; // Si es menor a 150mV, forzar 0 Amperios
 static constexpr float HYSTERESIS_MV   = 15.0f;  // Evita saltos por ruido pequeño
 // --- Variables de Control de Potenciómetro ---
 static float v_ema = 100.0f; 
 static uint32_t last_applied_delay = DEFAULT_SEMI_PERIOD_US;
-static constexpr float SAFE_DEADZONE_MV = 50.0f; // Ignora ruido hasta 200mV
+static constexpr float SAFE_DEADZONE_MV = 40.0f; // Ignora ruido hasta 200mV
 static constexpr uint32_t MAX_DELAY_STEP_US = 100; // Máximo cambio de delay por ciclo (100ms)
 
 // Nuevo límite superior de seguridad
-static constexpr uint32_t SAFE_MAX_DELAY_US = 8300; // Hard cap para el delay máximo (seguridad)
+static constexpr uint32_t SAFE_MAX_DELAY_US = 8250; // Hard cap para el delay máximo (seguridad)
 
 // === LÍMITES DE VALIDACIÓN DE FRECUENCIA ===
 static constexpr uint32_t MIN_PERIOD_VALID_US = 8264; // 60.5 Hz (Período más corto)
@@ -235,7 +235,7 @@ static void update_potentiometer() {
     if (!g_ads) return;
 
     // --- PARTE 1: FILTRO DE MEDIANA (20 MUESTRAS) ---
-    const int NUM_SAMPLES = 15; 
+    const int NUM_SAMPLES = 20; 
     float samples[NUM_SAMPLES];
     bool success = true;
 
@@ -512,7 +512,7 @@ static void monitor_task(void* arg) {
                  (unsigned long)measured_period_log, // NUEVO: Imprime el periodo mínimo histórico
                  g_scr_enabled ? "ON" : "OFF");
         
-        vTaskDelay(pdMS_TO_TICKS(500)); // Log cada 500 ms
+        vTaskDelay(pdMS_TO_TICKS(1500)); // Log cada 500 ms
     }
 }
 
