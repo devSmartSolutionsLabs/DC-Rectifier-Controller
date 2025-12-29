@@ -235,7 +235,7 @@ static void update_potentiometer() {
     if (!g_ads) return;
 
     // --- PARTE 1: FILTRO DE MEDIANA (20 MUESTRAS) ---
-    const int NUM_SAMPLES = 20; 
+    const int NUM_SAMPLES = 10; 
     float samples[NUM_SAMPLES];
     bool success = true;
 
@@ -282,7 +282,7 @@ static void update_potentiometer() {
 
     // Usamos potencia 1.2 en lugar de raíz cuadrada (0.5). 
     // Esto hace que el inicio de la curva sea mucho más plano y controlable.
-    float compensated_factor = powf(normalized, 1.3f); 
+    float compensated_factor = powf(normalized, 1.15f); 
 
     uint32_t current_point = (uint32_t)floorf(compensated_factor * NUM_POINTS_F);
     if (current_point >= (uint32_t)NUM_POINTS_F) current_point = (uint32_t)NUM_POINTS_F - 1;
