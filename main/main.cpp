@@ -20,7 +20,7 @@ static const char* TAG = "RECTIFICADOR";
 
 
 // === Configuración SCR ===
-static constexpr uint32_t PULSE_US       = 250;     // ANCHO DEL PULSO: 700 us
+static constexpr uint32_t PULSE_US       = 50;     // ANCHO DEL PULSO: 700 us
 static constexpr uint32_t DEBOUNCE_US    = 700;    // anti-rebote ZC (2.5 ms)
 static constexpr uint32_t DEFAULT_SEMI_PERIOD_US = 8150; // 60Hz
 
