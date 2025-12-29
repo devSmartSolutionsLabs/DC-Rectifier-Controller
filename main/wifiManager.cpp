@@ -5,6 +5,7 @@
 #include "nvs_flash.h"
 #include <string.h>
 
+
 static const char* TAG = "WIFI_MGR";
 static int s_retry_num = 0;
 #define MAX_RETRIES 5
@@ -159,6 +160,7 @@ bool WifiManager::connect_saved() {
     esp_wifi_set_mode(WIFI_MODE_STA);
     esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
     esp_wifi_start();
+    esp_wifi_set_ps(WIFI_PS_NONE);
     esp_wifi_connect();
     
     return true;

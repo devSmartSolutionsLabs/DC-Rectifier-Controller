@@ -43,12 +43,17 @@ static PortalWeb g_portal;
 // Global en main.cpp
 volatile bool g_is_wifi_scanning = false; // Aquí sí se define y se inicializa
 // === Configuración SCR ===
-static constexpr uint32_t PULSE_US       = 700;     // ANCHO DEL PULSO: 700 us
-static constexpr uint32_t DEBOUNCE_US    = 2500;    // anti-rebote ZC (2.5 ms)
-static constexpr uint32_t DEFAULT_SEMI_PERIOD_US = 8333; // 60Hz
+static constexpr uint32_t PULSE_US       = 70;     // ANCHO DEL PULSO: 700 us
+static constexpr uint32_t DEBOUNCE_US    = 500;    // anti-rebote ZC (2.5 ms)
+static constexpr uint32_t DEFAULT_SEMI_PERIOD_US = 8200; // 60Hz
+
+static float v_ema = 100.0f; 
+static uint32_t last_applied_delay = DEFAULT_SEMI_PERIOD_US;
+static constexpr float SAFE_DEADZONE_MV = 40.0f; // Ignora ruido hasta 200mV
+static constexpr uint32_t MAX_DELAY_STEP_US = 100; // Máximo cambio de delay por ciclo (100ms)
 
 // Pines 
-static const gpio_num_t ZC_PIN[3]  = { GPIO_NUM_38, GPIO_NUM_21, GPIO_NUM_43 };
+static const gpio_num_t ZC_PIN[3]  = { GPIO_NUM_38, GPIO_NUM_21, GPIO_NUM_14 };
 static const gpio_num_t SCR_PIN[3] = { GPIO_NUM_48, GPIO_NUM_47, GPIO_NUM_44 };
 
 // === Configuración I2C ÚNICA (Consolidada) ===
@@ -67,12 +72,12 @@ static constexpr float NUM_POINTS_F     = MAX_CURRENT_A / CURRENT_STEP_A; // 500
 static constexpr float DELAY_RANGE_US_F = NUM_POINTS_F * DELAY_STEP_US;   // 1000.0f * 6.0f = 6000.0f
 
 // Límites de Potenciómetro
-static constexpr float POT_MIN_MV       = 200.0f;  // Mínimo mapeado
+static constexpr float POT_MIN_MV       = 50.0f;  // Mínimo mapeado
 static constexpr float POT_MAX_MV       = 4100.0f;  // Máximo mapeado
 static constexpr float MV_RANGE         = POT_MAX_MV - POT_MIN_MV; 
 
 // Nuevo límite superior de seguridad
-static constexpr uint32_t SAFE_MAX_DELAY_US = 8320; // Hard cap para el delay máximo (seguridad)
+static constexpr uint32_t SAFE_MAX_DELAY_US = 8250; // Hard cap para el delay máximo (seguridad)
 
 // === LÍMITES DE VALIDACIÓN DE FRECUENCIA ===
 static constexpr uint32_t MIN_PERIOD_VALID_US = 8264; // 60.5 Hz (Período más corto)
@@ -179,8 +184,20 @@ static void control_relays() {
 }
 
 static void set_direction(bool forward) {
-    a2_on = forward;    // Forward
-    a3_on = !forward;   // Reverse
+    g_scr_enabled = false; 
+    
+    // Reset total de filtros y estados
+    v_ema = POT_MIN_MV;
+    last_applied_delay = DEFAULT_SEMI_PERIOD_US;
+    
+    a2_on = forward;
+    a3_on = !forward;
+    control_relays();
+
+    // Tiempo muerto para que el relé físico cambie sin carga
+    vTaskDelay(pdMS_TO_TICKS(150)); 
+    
+    g_scr_enabled = true; 
 }
 
 // === Lectura de Botones ===
@@ -296,7 +313,7 @@ static void update_potentiometer() {
     if (!g_ads || !g_i2c_mutex) return;
 
     if (xSemaphoreTake(g_i2c_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-        const int NUM_SAMPLES = 7; // Reducimos muestras para no saturar el bus
+        const int NUM_SAMPLES = 10; // Reducimos muestras para no saturar el bus
         float samples[NUM_SAMPLES];
         bool success = true;
 
@@ -321,75 +338,56 @@ static void update_potentiometer() {
         // --- PARTE 2: MEDIA MÓVIL EXPONENCIAL (EMA) (Suaviza el drift lento) ---
         static float v_ema = 0.0f; 
         static bool v_ema_initialized = false;
-        const float ALPHA = 0.5f; 
         
-        if (!v_ema_initialized) { 
-            v_ema = v_mediana;
-            v_ema_initialized = true;
-        } else {
-            v_ema = (ALPHA * v_mediana) + ((1.0f - ALPHA) * v_ema);
-        }
-        
-        float mv = v_ema; // Usamos el valor suavizado para el control
-        
-        // ALMACENAR VALOR EMA
-        g_pot_mv = mv; 
+        // Filtro EMA para suavizar el movimiento de la mano
+    const float ALPHA = 0.60f; 
+    v_ema = (ALPHA * v_mediana) + ((1.0f - ALPHA) * v_ema);
+    g_pot_mv = v_ema;
 
-        // ------------------------------------------------------------------------------------------
-        // === LÓGICA DE MAPEO ADAPTATIVO Y SEGURO (MÍNIMO HISTÓRICO) ===
-        
-        // 1. Obtener el Mínimo Histórico del Semi-Período
-        uint32_t dynamic_semi_period = g_semi_period_measured_us; 
-        
-        // Aplicamos límites de validación de frecuencia para el fallback
-        if (dynamic_semi_period < MIN_PERIOD_VALID_US || dynamic_semi_period > MAX_PERIOD_VALID_US) { 
-            dynamic_semi_period = DEFAULT_SEMI_PERIOD_US;
-        }
+    // --- PARTE 3: LÓGICA DE ZONA MUERTA REFORZADA ---
+    uint32_t dynamic_delay_max = (g_semi_period_measured_us > SAFE_MAX_DELAY_US) ? SAFE_MAX_DELAY_US : g_semi_period_measured_us;
+    
+    if (v_ema < SAFE_DEADZONE_MV) {
+        g_scr_delay_us = dynamic_delay_max;
+        last_applied_delay = dynamic_delay_max;
+        return;
+    }
 
-        // Aplicar el hard cap de seguridad (8320 us) sobre el Mínimo Histórico
-        uint32_t dynamic_delay_max;
-        if (dynamic_semi_period > SAFE_MAX_DELAY_US) {
-            dynamic_delay_max = SAFE_MAX_DELAY_US;
-        } else {
-            dynamic_delay_max = dynamic_semi_period;
-        }
-        
-        uint32_t dynamic_delay_min = (uint32_t)(dynamic_delay_max - DELAY_RANGE_US_F);
+// --- PARTE 4: NORMALIZACIÓN Y COMPENSACIÓN SUAVE ---
+    // Asegúrate de que POT_MAX_MV sea realmente el voltaje máximo que entrega tu pote (ej. 3300 o 4000)
+    float normalized = (v_ema - SAFE_DEADZONE_MV) / (POT_MAX_MV - SAFE_DEADZONE_MV);
+    if (normalized < 0.0f) normalized = 0.0f;
+    if (normalized > 1.0f) normalized = 1.0f;
 
-        // Actualizar las variables globales usadas en la tarea de monitoreo
-        g_current_delay_max_us = dynamic_delay_max;
-        g_current_delay_min_us = dynamic_delay_min;
+    // Usamos potencia 1.2 en lugar de raíz cuadrada (0.5). 
+    // Esto hace que el inicio de la curva sea mucho más plano y controlable.
+    float compensated_factor = powf(normalized, 1.3f); 
 
-        // 2. Aplicar límites al voltaje
-        if (mv < POT_MIN_MV) mv = POT_MIN_MV;
-        if (mv > POT_MAX_MV) mv = POT_MAX_MV;
-        
-        // 3. Normalizar el voltaje al rango [0, 1]
-        float normalized = (mv - POT_MIN_MV) / MV_RANGE;
-        
-        // *** 4. COMPENSACIÓN INVERSA POR RAÍZ CUADRADA (Square Root Compensation) ***
-        // Propiedad: Genera un cambio RÁPIDO al inicio (bajo V_POT) y LENTO al final (alto V_POT),
-        // lo que da mayor resolución de control en la zona de alta corriente.
-        float compensated_factor = sqrtf(normalized); 
-        
-        // Convertir el valor compensado (0 a 1) a un punto de delay (0 a 999)
-        float point_float = compensated_factor * NUM_POINTS_F;
-        uint32_t current_point = (uint32_t)floorf(point_float);
-        
-        if (current_point >= (uint32_t)NUM_POINTS_F) {
-            current_point = (uint32_t)NUM_POINTS_F - 1; 
+    uint32_t current_point = (uint32_t)floorf(compensated_factor * NUM_POINTS_F);
+    if (current_point >= (uint32_t)NUM_POINTS_F) current_point = (uint32_t)NUM_POINTS_F - 1;
+    
+    // Calcular el Delay Objetivo (Target)
+    uint32_t target_delay = (uint32_t)(dynamic_delay_max - ((float)current_point * DELAY_STEP_US));
+
+    // --- PARTE 5: SLEW RATE LIMITER (EVITA SALTOS BRUSCOS) ---
+    // Si el cambio solicitado es mayor a 150us, lo limitamos.
+    uint32_t final_delay = target_delay;
+    
+    if (target_delay < last_applied_delay) {
+        uint32_t diff = last_applied_delay - target_delay;
+        if (diff > MAX_DELAY_STEP_US) {
+            final_delay = last_applied_delay - MAX_DELAY_STEP_US;
         }
-        
-        // 5. Mapeo Invertido y Discreto a Delay (usando el dynamic_delay_max capado)
-        // new_delay = DELAY_MAX - (current_point_compensado * DELAY_STEP_US)
-        uint32_t new_delay = (uint32_t)(dynamic_delay_max - ((float)current_point * DELAY_STEP_US));
-        
-        // 6. Asegurar límites finales
-        if (new_delay < dynamic_delay_min) new_delay = dynamic_delay_min;
-        if (new_delay > dynamic_delay_max) new_delay = dynamic_delay_max;
-        
-        // ALMACENAR VALOR FINAL DEL DELAY (usado por la ISR)
-        g_scr_delay_us = new_delay;
+    } else if (target_delay > last_applied_delay) {
+        uint32_t diff = target_delay - last_applied_delay;
+        if (diff > MAX_DELAY_STEP_US) {
+            final_delay = last_applied_delay + MAX_DELAY_STEP_US;
+        }
+    }
+
+    // Guardar para el próximo ciclo y aplicar
+    last_applied_delay = final_delay;
+    g_scr_delay_us = final_delay;
     }
     else {
         ESP_LOGW(TAG, "I2C ocupado, saltando lectura de pot.");
@@ -653,7 +651,7 @@ static void init_phase(int i, gpio_num_t zc, gpio_num_t scr) {
         .clk_src = GPTIMER_CLK_SRC_DEFAULT,
         .direction = GPTIMER_COUNT_UP,
         .resolution_hz = 1000000,
-        .intr_priority = 0,
+        .intr_priority = 3,
         .flags = {
             .intr_shared = true, // solo por agregar el wifi
             .allow_pd = false,
@@ -749,8 +747,9 @@ extern "C" void app_main(void) {
     // 4. HARDWARE: MCP23017 Y BUS I2C
     initialize_mcp_enables();
     i2c_init();
+    i2c_scanner();
 
-    g_mcp_2 = new MCP23017(I2C_PORT, 0x25); // El nuevo MCP en dirección 0x20
+    g_mcp_2 = new MCP23017(I2C_PORT, 0x20); // El nuevo MCP en dirección 0x20
     if (g_mcp_2->begin()) {
         ESP_LOGI("MCP_2", "Segundo MCP detectado en 0x20");
         // Aquí configuras el pin GPB5 para el Chip Select de la SD
@@ -930,13 +929,13 @@ extern "C" void app_main(void) {
     }
 
     // Tareas
-    if (xTaskCreate(button_task, "buttons", 4096, nullptr, 6, nullptr) != pdPASS) {
+    if (xTaskCreatePinnedToCore(button_task, "buttons", 4096, nullptr, 6, nullptr,1) != pdPASS) {
         ESP_LOGE(TAG, "Error creando tarea botones");
     }
-    if (xTaskCreate(control_task, "control", 8192, nullptr, 5, nullptr) != pdPASS) {
+    if (xTaskCreatePinnedToCore(control_task, "control", 8192, nullptr, 5, nullptr,1) != pdPASS) {
         ESP_LOGE(TAG, "Error creando tarea control");
     }
-    if (xTaskCreate(monitor_task, "monitor", 4096, nullptr, 1, nullptr) != pdPASS) {
+    if (xTaskCreatePinnedToCore(monitor_task, "monitor", 4096, nullptr, 1, nullptr,1) != pdPASS) {
         ESP_LOGE(TAG, "Error creando tarea monitoreo");
     }
 

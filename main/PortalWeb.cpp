@@ -65,6 +65,7 @@ void broadcast_debug_data(httpd_handle_t server) {
 
 esp_err_t PortalWeb::start() {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.core_id = 0; // El servidor web se queda en el Core 0 con el WiFi
     config.lru_purge_enable = true;
     config.max_uri_handlers = 15; // Suficientes para todos los endpoints
     config.send_wait_timeout = 15;
