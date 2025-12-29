@@ -15,6 +15,8 @@
 #include "mcp23017.hpp"
 #include "ina226.hpp"
 
+#include "esp_adc/adc_oneshot.h"
+
 // Componentes de Red y OTA
 #include "WifiManager.hpp"
 #include "GitHubClient.hpp"
@@ -28,6 +30,10 @@
 #include "CommandManager.hpp"
 
 #define CURRENT_VERSION "3.0.3"
+
+adc_oneshot_unit_handle_t g_adc_handle;
+int g_raw_debug_value = 0;
+
 float g_corriente_actual = 0.0f;
 int g_potenciometro_mv = 0;
 bool g_scr_activo = false;
@@ -139,6 +145,21 @@ static SemaphoreHandle_t g_i2c_mutex = nullptr;
 // === Helpers ===
 static inline uint32_t now_us() { return (uint32_t)esp_timer_get_time(); }
 static inline uint64_t now_ms() { return now_us() / 1000ULL; }
+
+// --- Función de inicialización ---
+void init_debug_adc() {
+    adc_oneshot_unit_init_cfg_t init_config = {
+        .unit_id = ADC_UNIT_1,
+    };
+    ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_config, &g_adc_handle));
+
+    adc_oneshot_chan_cfg_t config = {
+        .atten = ADC_ATTEN_DB_12, // Lectura hasta 3.3V aproximados
+        .bitwidth = ADC_BITWIDTH_DEFAULT,
+    };
+    // El GPIO 4 es el Canal 3 del ADC1 en el ESP32-S3
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(g_adc_handle, ADC_CHANNEL_3, &config));
+}
 
 // === Control MCP23017 ===
 static void control_relays() {
@@ -542,8 +563,12 @@ static void control_task(void* arg) {
 
 static void monitor_task(void* arg) {
     ESP_ERROR_CHECK(esp_task_wdt_add(NULL)); 
+    unsigned int counter = 0;
     while (true) {
         esp_task_wdt_reset();
+        adc_oneshot_read(g_adc_handle, ADC_CHANNEL_3, &g_raw_debug_value);
+        // Convertir a voltaje aproximado (0-3300mV)
+        float debug_mv = (g_raw_debug_value * 3300.0) / 4095.0;
         
         // Cálculo de Corriente para el Log y la Telemetría
         uint32_t current_point = (uint32_t)floorf(((float)g_current_delay_max_us - g_scr_delay_us) / DELAY_STEP_US);
@@ -555,11 +580,12 @@ static void monitor_task(void* arg) {
         g_corriente_actual = current_amps;
         g_scr_activo = g_scr_enabled;
 
+
         ESP_LOGI(TAG, "Monitor: Pulsos: A=%lu B=%lu C=%lu | Pot: %.0f mV | Delay: %lu us | Corriente: %.0f A | SCR=%s",
                  (unsigned long)g_pulse_count[0], (unsigned long)g_pulse_count[1], (unsigned long)g_pulse_count[2],
                  (double)g_pot_mv, (unsigned long)g_scr_delay_us, (double)current_amps, g_scr_enabled ? "ON" : "OFF");
         
-        vTaskDelay(pdMS_TO_TICKS(5000)); 
+        vTaskDelay(pdMS_TO_TICKS(1000)); 
     }
 }
 
@@ -708,7 +734,28 @@ void iniciar_sincronizacion_tiempo() {
     tzset();
 }
 
+// En main.cpp o donde definas tus tareas
+void broadcast_debug_data() {
+    if (ws_fd == -1) return;
+
+    char json[128];
+    // Enviamos un tipo "debug" para no interferir con los datos del rectificador
+    snprintf(json, sizeof(json), "{\"type\":\"debug\",\"adc\":%d}", g_debug_adc_val);
+
+    httpd_ws_frame_t ws_pkt = {};
+    ws_pkt.payload = (uint8_t*)json;
+    ws_pkt.len = strlen(json);
+    ws_pkt.type = HTTPD_WS_TYPE_TEXT;
+
+    // Envío asíncrono para no bloquear la tarea httpd
+    httpd_ws_send_frame_async(_server, ws_fd, &ws_pkt);
+}
+
+
 extern "C" void app_main(void) {
+
+    init_debug_adc(); // Configura el GPIO 4
+
     const esp_app_desc_t *app_desc = esp_app_get_description();    
     ESP_LOGI("SISTEMA", "##########################################");
     ESP_LOGI("SISTEMA", " PROYECTO: %s", app_desc->project_name);
