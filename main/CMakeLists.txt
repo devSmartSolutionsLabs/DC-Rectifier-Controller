@@ -29,4 +29,6 @@ idf_component_register(
         mbedtls             # <--- Requerido para el motor de cifrado
         spiffs 
         esp_partition
+        fatfs       # <--- AGREGAR ESTE
+        sdmmc       # <--- AGREGAR ESTE
 )
