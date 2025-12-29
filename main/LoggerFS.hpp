@@ -50,6 +50,7 @@ class LoggerFS {
 public:
     explicit LoggerFS(const char* base_path);
     bool begin(); 
+    bool is_card_inserted(); // <--- AÑADIR ESTA LÍNEA
     void registrar(RectEvent evento, const RectStatus& status, const std::string& nota = "");
     void registrarEstructurado(RectEvent evento, std::string valor, std::string nota);
     void limpiarLog();
