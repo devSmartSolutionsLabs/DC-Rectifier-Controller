@@ -47,7 +47,7 @@ esp_err_t PortalWeb::start() {
     config.max_uri_handlers = 15; // Suficientes para todos los endpoints
     config.send_wait_timeout = 15;
     config.stack_size = 10240;
-    
+
     ESP_LOGI(TAG, "Iniciando Servidor Web...");
 
     if (httpd_start(&_server, &config) == ESP_OK) {
@@ -102,10 +102,10 @@ esp_err_t PortalWeb::start() {
                 if (!f) return httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "No hay logs");
                 
                 httpd_resp_set_type(req, "text/plain");
-                char line[128];
+                char line[512];
                 while (fgets(line, sizeof(line), f)) {
                     httpd_resp_sendstr_chunk(req, line);
-                    vTaskDelay(1);
+                    vTaskDelay(pdMS_TO_TICKS(2));
                 }
                 fclose(f);
                 return httpd_resp_sendstr_chunk(req, NULL);
