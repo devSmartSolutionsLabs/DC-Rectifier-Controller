@@ -42,17 +42,14 @@ static constexpr uint32_t DEBOUNCE_US    = 2500;    // anti-rebote ZC (2.5 ms)
 static constexpr uint32_t DEFAULT_SEMI_PERIOD_US = 8333; // 60Hz
 
 // Pines 
-static const gpio_num_t ZC_PIN[3]  = { GPIO_NUM_38, GPIO_NUM_21, GPIO_NUM_14 };
-static const gpio_num_t SCR_PIN[3] = { GPIO_NUM_48, GPIO_NUM_47, GPIO_NUM_13 };
+static const gpio_num_t ZC_PIN[3]  = { GPIO_NUM_38, GPIO_NUM_21, GPIO_NUM_43 };
+static const gpio_num_t SCR_PIN[3] = { GPIO_NUM_48, GPIO_NUM_47, GPIO_NUM_44 };
 
-// === Configuración I2C ===
+// === Configuración I2C ÚNICA (Consolidada) ===
 static constexpr i2c_port_t I2C_PORT = I2C_NUM_0;
-static constexpr i2c_port_t I2C_PORT_1 = I2C_NUM_1;
-static constexpr gpio_num_t I2C_SDA = GPIO_NUM_5;
-static constexpr gpio_num_t I2C_SCL = GPIO_NUM_4;
-static constexpr gpio_num_t I2C1_SDA = GPIO_NUM_43;
-static constexpr gpio_num_t I2C1_SCL = GPIO_NUM_44;
-static constexpr uint32_t   I2C_HZ  = 400000;
+static constexpr gpio_num_t I2C_SDA  = GPIO_NUM_5;
+static constexpr gpio_num_t I2C_SCL  = GPIO_NUM_4;
+static constexpr uint32_t   I2C_HZ   = 400000;
 
 // === CONSTANTES GLOBALES DE MAPEO (Refactorizadas) ===
 static constexpr float MAX_CURRENT_A    = 5000.0f;      // Corriente máxima total
@@ -109,10 +106,11 @@ static bool shutting_down = false;
 // === Instancias ===
 static ADS1115* g_ads = nullptr;
 static MCP23017* g_mcp = nullptr;
+MCP23017* g_mcp_2 = nullptr;  // El nuevo para la SD y otros usos (0x20)
 static INA226* g_ina = nullptr;
 
 // Instancia Global del Logger
-LoggerFS g_logger("/spiffs");
+LoggerFS g_logger("/sd");
 
 RectStatus obtener_estado_actual() {
     RectStatus status;
@@ -247,6 +245,25 @@ static void read_buttons() {
     // ESP_ERROR_CHECK(esp_task_wdt_reset()); // Se mueve a button_task
 }
 
+void i2c_scanner() {
+    ESP_LOGI("SCANNER", "Iniciando escaneo del bus I2C...");
+    int encontrados = 0;
+    for (int i = 1; i < 127; i++) {
+        i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+        i2c_master_start(cmd);
+        i2c_master_write_byte(cmd, (i << 1) | I2C_MASTER_WRITE, true);
+        i2c_master_stop(cmd);
+        esp_err_t ret = i2c_master_cmd_begin(I2C_PORT, cmd, pdMS_TO_TICKS(10));
+        i2c_cmd_link_delete(cmd);
+
+        if (ret == ESP_OK) {
+            ESP_LOGI("SCANNER", "Dispositivo encontrado en direccion: 0x%02X", i);
+            encontrados++;
+        }
+    }
+    if (encontrados == 0) ESP_LOGW("SCANNER", "No se encontraron dispositivos I2C.");
+}
+
 // === Lectura de Potenciómetro y Mapeo Adaptativo ===
 static void update_potentiometer() {
     if (g_is_wifi_scanning) {
@@ -255,14 +272,9 @@ static void update_potentiometer() {
     }
 
     if (!g_ads || !g_i2c_mutex) return;
-    
-    // --- PARTE 1: FILTRO DE MEDIANA (Elimina picos de ruido) ---
-    const int NUM_SAMPLES = 11; 
-    float samples[NUM_SAMPLES];
-    bool success = true;
 
     if (xSemaphoreTake(g_i2c_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-        const int NUM_SAMPLES = 5; // Reducimos muestras para no saturar el bus
+        const int NUM_SAMPLES = 7; // Reducimos muestras para no saturar el bus
         float samples[NUM_SAMPLES];
         bool success = true;
 
@@ -547,7 +559,7 @@ static void monitor_task(void* arg) {
                  (unsigned long)g_pulse_count[0], (unsigned long)g_pulse_count[1], (unsigned long)g_pulse_count[2],
                  (double)g_pot_mv, (unsigned long)g_scr_delay_us, (double)current_amps, g_scr_enabled ? "ON" : "OFF");
         
-        vTaskDelay(pdMS_TO_TICKS(1500)); 
+        vTaskDelay(pdMS_TO_TICKS(5000)); 
     }
 }
 
@@ -662,21 +674,6 @@ static void i2c_init() {
     };
     ESP_ERROR_CHECK(i2c_param_config(I2C_PORT, &i2c_config));
     ESP_ERROR_CHECK(i2c_driver_install(I2C_PORT, I2C_MODE_MASTER, 0, 0, 0));
-
-    // Puerto 1 para INA226
-    i2c_config_t i2c_config1 = {
-        .mode = I2C_MODE_MASTER,
-        .sda_io_num = I2C1_SDA,
-        .scl_io_num = I2C1_SCL,
-        .sda_pullup_en = GPIO_PULLUP_ENABLE,
-        .scl_pullup_en = GPIO_PULLUP_ENABLE,
-        .master = {
-            .clk_speed = 100000, // INA226 típicamente a 100kHz
-        },
-        .clk_flags = 0,
-    };
-    ESP_ERROR_CHECK(i2c_param_config(I2C_PORT_1, &i2c_config1));
-    ESP_ERROR_CHECK(i2c_driver_install(I2C_PORT_1, I2C_MODE_MASTER, 0, 0, 0));
 }
 
 // === Inicialización de pines de habilitación MCP23017 ===
@@ -719,15 +716,45 @@ extern "C" void app_main(void) {
     ESP_LOGI("SISTEMA", " COMPILADO: %s %s", app_desc->date, app_desc->time);
     ESP_LOGI("SISTEMA", "##########################################");
     
+    // 4. HARDWARE: MCP23017 Y BUS I2C
+    initialize_mcp_enables();
+    i2c_init();
+
+    g_mcp_2 = new MCP23017(I2C_PORT, 0x25); // El nuevo MCP en dirección 0x20
+    if (g_mcp_2->begin()) {
+        ESP_LOGI("MCP_2", "Segundo MCP detectado en 0x20");
+        // Aquí configuras el pin GPB5 para el Chip Select de la SD
+        g_mcp_2->pin_mode(13, 0); // CS - Pin 13 es GPB5, modo 0 es OUTPUT
+        g_mcp_2->pin_mode(14, 1); // CD - Pin 14 es GPB6, modo 0 es INPUT
+        
+        g_mcp_2->digital_write(13, 0); // CS en alto (deseleccionado)
+        g_mcp_2->pin_pullup(14, true);
+        
+    } else {
+        ESP_LOGE("MCP_2", "No se encontró el segundo MCP");
+    }
+    ///////////////
+    vTaskDelay(pdMS_TO_TICKS(50));
+    long last_t = WifiManager::get_last_time();
+    if (last_t > 1700000000) { // Si es una fecha válida post-2023
+        struct timeval tv = { .tv_sec = last_t };
+        settimeofday(&tv, NULL);
+        ESP_LOGI("TIME", "Reloj recuperado de NVS");
+    }
+    vTaskDelay(pdMS_TO_TICKS(50));
+
     if (g_logger.begin()) {
-        ESP_LOGI(TAG, "LoggerFS inicializado correctamente.");
+        ESP_LOGI("MAIN", "Escribiendo log de prueba...");
+        //g_logger.registrarEstructurado(RectEvent::BOOT, "3.0.3-SD", "Prueba de escritura manual");
+    } else {
+        ESP_LOGE(TAG, "ERROR: Tarjeta SD no lista. Revisa GPB6.");
     }
     
     struct stat st;
-    if (stat("/spiffs", &st) == 0) {
-        ESP_LOGI("VERIFICACION", "La ruta /spiffs existe y es accesible.");
+    if (stat("/sd", &st) == 0) {
+        ESP_LOGI("VERIFICACION", "La ruta /sd existe y es accesible.");
     } else {
-        ESP_LOGE("VERIFICACION", "La ruta /spiffs NO existe en el VFS.");
+        ESP_LOGE("VERIFICACION", "La ruta /sd NO existe en el VFS.");
     }
 
     // Primero inicializar los componentes de red/memoria
@@ -758,12 +785,14 @@ extern "C" void app_main(void) {
             // En lugar de registrar inmediatamente, podrías usar un flag
             // o imprimir un log simple primero para ver si sobrevive
             ESP_LOGI(TAG, "Conexión exitosa. IP: %s", WifiManager::get_ip().c_str());
-            
+            vTaskDelay(pdMS_TO_TICKS(500));
             // Intenta registrar con una nota estática (ocupa menos stack)
             g_logger.registrarEstructurado(RectEvent::NET_SSID, WifiManager::get_ssid(), "Conectado");
+            vTaskDelay(pdMS_TO_TICKS(500));
             g_logger.registrarEstructurado(RectEvent::NET_IP, WifiManager::get_ip(), "DHCP OK");
         }
         else{
+            vTaskDelay(pdMS_TO_TICKS(500));
             g_logger.registrarEstructurado(RectEvent::ERR_SYSTEM, "WIFI_TIMEOUT", "Fallo conexion a red guardada");
         }
     }
@@ -778,9 +807,13 @@ extern "C" void app_main(void) {
                 "Portal AP Activo"         // Nota
             );
         WifiManager::start_ap();
-        g_portal.start();
     }
     
+    if (g_portal.start() == ESP_OK) {
+        ESP_LOGI(TAG, "Servidor Web iniciado en: %s", 
+                WifiManager::is_connected() ? WifiManager::get_ip().c_str() : "192.168.4.1");
+    }
+
     esp_log_level_set("*", ESP_LOG_INFO);
     ESP_LOGI(TAG, "=== INICIANDO SISTEMA COMPLETO ESP-IDF v5.5.1 ===");
 
@@ -809,9 +842,7 @@ extern "C" void app_main(void) {
     };
     usb_serial_jtag_driver_install(&usb_serial_jtag_config);
 
-    // 4. HARDWARE: MCP23017 Y BUS I2C
-    initialize_mcp_enables();
-
+    
     // Mutex
     g_i2c_mutex = xSemaphoreCreateMutex();
     if (g_i2c_mutex == NULL) {
@@ -823,14 +854,6 @@ extern "C" void app_main(void) {
         );
         ESP_LOGE(TAG, "Error creando mutex I2C");
         return;
-    }
-
-    // I2C
-    i2c_init();
-
-    // 5. INICIAR PORTAL WEB (Gestión WiFi y OTA GitHub)
-    if (g_portal.start() == ESP_OK) {
-        ESP_LOGI(TAG, "Portal Web iniciado en http://192.168.4.1 (o IP local)");
     }
 
     // 5. DISPOSITIVOS I2C
@@ -863,8 +886,8 @@ extern "C" void app_main(void) {
         ESP_LOGE(TAG, "Error inicializando MCP23017");
         g_logger.registrarEstructurado(RectEvent::ERR_I2C, "MCP23017", "Fallo de inicializacion");
     }
-
-    g_ina = new INA226(I2C_PORT_1, 0x40, g_i2c_mutex);
+    
+    g_ina = new INA226(I2C_PORT, 0x40, g_i2c_mutex);
     if (g_ina->begin()) {
         ESP_LOGI(TAG, "INA226 configurado (solo monitoreo)");
     } else {
@@ -893,8 +916,8 @@ extern "C" void app_main(void) {
                                     "Hardware Listo - Esperando Operario" // La nota descriptiva
             );
 
-    ESP_LOGI(TAG, "Mapeo Pot: %.0f mV-%.0f mV -> 0A-%.0fA (%.0f pasos, %.1f us/paso) | Max Delay Seguro: %lu us",
-             POT_MIN_MV, POT_MAX_MV, MAX_CURRENT_A, NUM_POINTS_F, DELAY_STEP_US, SAFE_MAX_DELAY_US);
+    //ESP_LOGI(TAG, "Mapeo Pot: %.0f mV-%.0f mV -> 0A-%.0fA (%.0f pasos, %.1f us/paso) | Max Delay Seguro: %lu us",
+    //         POT_MIN_MV, POT_MAX_MV, MAX_CURRENT_A, NUM_POINTS_F, DELAY_STEP_US, SAFE_MAX_DELAY_US);
 
     // Loop principal
 
