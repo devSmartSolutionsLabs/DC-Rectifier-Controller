@@ -14,6 +14,9 @@ public:
     static void start_ap();
     static std::string scan_to_json();
     static void save_and_reconnect(std::string ssid, std::string pass);
+    static void save_last_time(long timestamp);
+    static long get_last_time();
+
     static bool is_connected();
     static bool should_fallback();
     

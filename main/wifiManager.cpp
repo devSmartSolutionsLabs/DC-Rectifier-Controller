@@ -206,3 +206,22 @@ std::string WifiManager::get_ip() {
     }
     return "0.0.0.0";
 }
+
+void WifiManager::save_last_time(long timestamp) {
+    nvs_handle_t handle;
+    if (nvs_open("storage", NVS_READWRITE, &handle) == ESP_OK) {
+        nvs_set_i64(handle, "last_time", (int64_t)timestamp);
+        nvs_commit(handle);
+        nvs_close(handle);
+    }
+}
+
+long WifiManager::get_last_time() {
+    nvs_handle_t handle;
+    int64_t timestamp = 0;
+    if (nvs_open("storage", NVS_READONLY, &handle) == ESP_OK) {
+        nvs_get_i64(handle, "last_time", &timestamp);
+        nvs_close(handle);
+    }
+    return (long)timestamp;
+}
