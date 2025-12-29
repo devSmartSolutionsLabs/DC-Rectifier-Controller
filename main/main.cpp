@@ -150,6 +150,7 @@ static inline uint64_t now_ms() { return now_us() / 1000ULL; }
 void init_debug_adc() {
     adc_oneshot_unit_init_cfg_t init_config = {
         .unit_id = ADC_UNIT_1,
+        .ulp_mode = ADC_ULP_MODE_DISABLE,
     };
     ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_config, &g_adc_handle));
 
@@ -535,7 +536,7 @@ static void IRAM_ATTR zc_isr(void* arg) {
 
 // === Tareas ===
 static void button_task(void* arg) {
-    // LLAMADA UNICA: Suscribir la tarea al WDT
+    // LLAMADA UNICA: Suscribir la tarea al WDTesp
     ESP_ERROR_CHECK(esp_task_wdt_add(NULL)); 
     ESP_LOGI(TAG, "Tarea botones iniciada");
     
@@ -563,12 +564,12 @@ static void control_task(void* arg) {
 
 static void monitor_task(void* arg) {
     ESP_ERROR_CHECK(esp_task_wdt_add(NULL)); 
-    unsigned int counter = 0;
+    // unsigned int counter = 0;
     while (true) {
         esp_task_wdt_reset();
         adc_oneshot_read(g_adc_handle, ADC_CHANNEL_3, &g_raw_debug_value);
         // Convertir a voltaje aproximado (0-3300mV)
-        float debug_mv = (g_raw_debug_value * 3300.0) / 4095.0;
+        // float debug_mv = (g_raw_debug_value * 3300.0) / 4095.0;
         
         // Cálculo de Corriente para el Log y la Telemetría
         uint32_t current_point = (uint32_t)floorf(((float)g_current_delay_max_us - g_scr_delay_us) / DELAY_STEP_US);
@@ -585,7 +586,7 @@ static void monitor_task(void* arg) {
                  (unsigned long)g_pulse_count[0], (unsigned long)g_pulse_count[1], (unsigned long)g_pulse_count[2],
                  (double)g_pot_mv, (unsigned long)g_scr_delay_us, (double)current_amps, g_scr_enabled ? "ON" : "OFF");
         
-        vTaskDelay(pdMS_TO_TICKS(1000)); 
+        vTaskDelay(pdMS_TO_TICKS(5000)); 
     }
 }
 
@@ -734,24 +735,6 @@ void iniciar_sincronizacion_tiempo() {
     tzset();
 }
 
-// En main.cpp o donde definas tus tareas
-void broadcast_debug_data() {
-    if (ws_fd == -1) return;
-
-    char json[128];
-    // Enviamos un tipo "debug" para no interferir con los datos del rectificador
-    snprintf(json, sizeof(json), "{\"type\":\"debug\",\"adc\":%d}", g_debug_adc_val);
-
-    httpd_ws_frame_t ws_pkt = {};
-    ws_pkt.payload = (uint8_t*)json;
-    ws_pkt.len = strlen(json);
-    ws_pkt.type = HTTPD_WS_TYPE_TEXT;
-
-    // Envío asíncrono para no bloquear la tarea httpd
-    httpd_ws_send_frame_async(_server, ws_fd, &ws_pkt);
-}
-
-
 extern "C" void app_main(void) {
 
     init_debug_adc(); // Configura el GPIO 4
@@ -784,7 +767,7 @@ extern "C" void app_main(void) {
     vTaskDelay(pdMS_TO_TICKS(50));
     long last_t = WifiManager::get_last_time();
     if (last_t > 1700000000) { // Si es una fecha válida post-2023
-        struct timeval tv = { .tv_sec = last_t };
+        struct timeval tv = { .tv_sec = last_t, .tv_usec = 0 };
         settimeofday(&tv, NULL);
         ESP_LOGI("TIME", "Reloj recuperado de NVS");
     }

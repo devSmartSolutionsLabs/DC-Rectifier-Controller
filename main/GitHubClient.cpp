@@ -9,6 +9,7 @@
 #include <sstream>
 #include <vector>
 #include <cstdlib> // Necesario para atoi
+#include "LoggerFS.hpp"
 static const char *TAG = "GH_CLIENT";
 
 // URL base de tu repositorio
@@ -17,6 +18,7 @@ static const char *TAG = "GH_CLIENT";
 extern "C" {
     extern volatile bool g_scr_enabled;
 }
+extern LoggerFS g_logger;
 
 static char* github_url_to_save = nullptr;
 
@@ -88,6 +90,8 @@ void GitHubClient::ota_task(void* pvParameter) {
     esp_https_ota_config_t ota_config = {};
     ota_config.http_config = &config;
 
+    g_logger.registrarEstructurado(RectEvent::OTA_START, "v3.0.2", "Descargando desde GitHub");
+
     esp_err_t ret = esp_https_ota(&ota_config);
 
     if (ret == ESP_OK) {
@@ -95,6 +99,9 @@ void GitHubClient::ota_task(void* pvParameter) {
         vTaskDelay(pdMS_TO_TICKS(2000));
         esp_restart();
     } else {
+        char err_buf[32];
+        snprintf(err_buf, sizeof(err_buf), "Error:0x%X", ret);
+        g_logger.registrarEstructurado(RectEvent::ERR_SYSTEM, err_buf, "Fallo en descarga OTA");
         ESP_LOGE(TAG, "Error durante el proceso OTA: %s", esp_err_to_name(ret));
     }
 
