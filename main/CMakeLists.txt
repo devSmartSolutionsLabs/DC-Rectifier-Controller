@@ -14,6 +14,7 @@ idf_component_register(
         "github_root_ca.pem" 
         "index.html"
     REQUIRES 
+        esp_adc
         driver 
         freertos 
         esp_timer 
