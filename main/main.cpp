@@ -250,7 +250,7 @@ static void read_buttons() {
         }
     } else {
         if (last_b0){
-        g_logger.registrarEstructurado(RectEvent::BTN_START_RELEASE, "-", "Boton START liberado");        
+        g_logger.registrarEstructurado(RectEvent::BTN_START_RELEASE, "STOPPING PROCESS", "Boton START liberado");        
             if ((a0_on || a1_on || g_scr_enabled)) {
                 // Iniciar secuencia de apagado
                 a1_on = false;
@@ -749,7 +749,7 @@ extern "C" void app_main(void) {
     i2c_init();
     i2c_scanner();
 
-    g_mcp_2 = new MCP23017(I2C_PORT, 0x20); // El nuevo MCP en dirección 0x20
+    g_mcp_2 = new MCP23017(I2C_PORT, 0x25); // El nuevo MCP en dirección 0x20
     if (g_mcp_2->begin()) {
         ESP_LOGI("MCP_2", "Segundo MCP detectado en 0x20");
         // Aquí configuras el pin GPB5 para el Chip Select de la SD

@@ -71,7 +71,7 @@ esp_err_t PortalWeb::start() {
     config.send_wait_timeout = 15;
     config.recv_wait_timeout = 15; // Añadido para estabilidad
     config.stack_size = 10240;
-    config.task_priority = 10;      // Mayor prioridad para fluidez del portal
+    config.task_priority = 2;      // Mayor prioridad para fluidez del portal
 
     ESP_LOGI(TAG, "Iniciando Servidor Web...");
 
